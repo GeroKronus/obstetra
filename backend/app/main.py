@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from . import vault
 from .config import settings
 from .db import init_db
 from .webhook import router as webhook_router
@@ -17,6 +18,10 @@ log = logging.getLogger("obstetra")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    try:
+        await vault.init_vault()
+    except Exception:
+        log.exception("vault init falhou — bot vai funcionar sem contexto da paciente")
     log.info("Obstetra backend started (model=%s)", settings.anthropic_model)
     yield
 

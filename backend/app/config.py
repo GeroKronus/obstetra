@@ -18,5 +18,14 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Vault (Obsidian + GitHub) — opcional; se vazio, o bot roda sem contexto da paciente
+    vault_repo_url: str = ""
+    vault_local_path: str = "/data/vault"
+    vault_ssh_private_key: str = ""
+    vault_git_user_name: str = "Obstetra Bot"
+    vault_git_user_email: str = "obstetra-bot@noreply.local"
+    # Quanto tempo (segundos) o cache local do vault é considerado fresco antes de um novo pull
+    vault_pull_max_age_s: int = 30
+
 
 settings = Settings()

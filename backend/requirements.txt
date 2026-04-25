@@ -6,3 +6,4 @@ httpx>=0.28.1
 pydantic>=2.10.3
 pydantic-settings>=2.7.0
 python-dotenv>=1.0.1
+python-frontmatter>=1.1.0

@@ -5,6 +5,7 @@ from typing import Any
 import anthropic
 from sqlmodel import Session, select
 
+from . import vault
 from .config import settings
 from .escalation import notify_doctor
 from .models import (
@@ -96,13 +97,18 @@ def _build_messages(
     patient: Patient,
     history: list[Message],
     inbound_text: str,
+    vault_ctx: vault.PatientContext,
 ) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = []
     for m in history:
         role = "user" if m.direction == MessageDirection.INBOUND else "assistant"
         msgs.append({"role": role, "content": m.text})
 
-    last_user_content = f"{_patient_context_block(patient)}\n\n{inbound_text}"
+    last_user_content = (
+        f"{vault_ctx.to_prompt_block()}\n\n"
+        f"{_patient_context_block(patient)}\n\n"
+        f"{inbound_text}"
+    )
     msgs.append({"role": "user", "content": last_user_content})
     return msgs
 
@@ -129,7 +135,17 @@ class ClinicalAgent:
         ).all()
         history = list(reversed(history))
 
-        messages = _build_messages(patient, history, inbound_text)
+        try:
+            vault_ctx = await vault.read_patient(patient.phone)
+        except Exception:
+            log.exception("vault.read_patient falhou — seguindo sem contexto")
+            vault_ctx = vault.PatientContext(found=False)
+
+        messages = _build_messages(patient, history, inbound_text, vault_ctx)
+
+        # Track o que aconteceu neste turno pra logar no vault depois
+        outbound_msgs_this_turn: list[str] = []
+        escalation_info: dict[str, str] | None = None
 
         for iteration in range(MAX_TOOL_ITERATIONS):
             response = await self._client.messages.create(
@@ -174,6 +190,16 @@ class ClinicalAgent:
 
             tool_results: list[dict[str, Any]] = []
             for tool_use in tool_uses:
+                # Captura intent pra logar no vault depois
+                if tool_use.name == "responder_paciente":
+                    texto = str(tool_use.input.get("texto", "")).strip()
+                    if texto:
+                        outbound_msgs_this_turn.append(texto)
+                elif tool_use.name == "escalar_para_doutora":
+                    escalation_info = {
+                        "motivo": str(tool_use.input.get("motivo", "")),
+                        "resumo": str(tool_use.input.get("resumo", "")),
+                    }
                 try:
                     result_text = await self._execute_tool(
                         tool_use.name,
@@ -214,6 +240,20 @@ class ClinicalAgent:
         patient.updated_at = utcnow()
         db.add(patient)
         db.commit()
+
+        # Loga o turno no vault (best-effort — não falha o fluxo se quebrar)
+        try:
+            escalation_summary = None
+            if escalation_info:
+                escalation_summary = f"escalada como `{escalation_info['motivo']}` — {escalation_info['resumo']}"
+            await vault.append_conversation(
+                patient.phone,
+                inbound_messages=[inbound_text],
+                outbound_messages=outbound_msgs_this_turn,
+                escalation_summary=escalation_summary,
+            )
+        except Exception:
+            log.exception("vault.append_conversation falhou para patient=%s", patient.phone)
 
     async def _execute_tool(
         self,
