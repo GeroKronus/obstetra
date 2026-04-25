@@ -19,6 +19,7 @@ import stat
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,34 @@ def _extract_section(body: str, heading: str) -> str | None:
     return text or None
 
 
+def _parse_date(value: Any) -> date | None:
+    """Aceita objeto date (PyYAML deserializa datas ISO assim) ou string."""
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str) and value.strip():
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _compute_gestational_data(dum: date | None) -> tuple[int | None, str | None]:
+    """A partir da DUM, calcula semanas atuais (inteiro) e DPP (DUM + 280 dias)."""
+    if not dum:
+        return None, None
+    today = date.today()
+    delta_days = (today - dum).days
+    if delta_days < 0:
+        # DUM no futuro — provavelmente erro de digitação; ignora
+        return None, None
+    semanas = delta_days // 7
+    dpp = (dum + timedelta(days=280)).isoformat()
+    return semanas, dpp
+
+
 async def read_patient(phone: str) -> PatientContext:
     if not _is_enabled():
         return PatientContext(found=False)
@@ -236,13 +265,26 @@ async def read_patient(phone: str) -> PatientContext:
             return [str(x) for x in value if x]
         return [str(value)]
 
+    # DUM é a fonte da verdade — calcula semanas atuais e DPP em runtime.
+    # Se DUM não estiver presente, cai pros campos legados como fallback.
+    dum = _parse_date(fm.get("dum"))
+    semanas_calc, dpp_calc = _compute_gestational_data(dum)
+
+    semanas_final = semanas_calc if semanas_calc is not None else fm.get("semanas_atuais")
+    if dpp_calc:
+        dpp_final = dpp_calc
+    elif fm.get("data_provavel_parto"):
+        dpp_final = str(fm.get("data_provavel_parto"))
+    else:
+        dpp_final = None
+
     return PatientContext(
         found=True,
         nome=fm.get("nome"),
-        semanas_atuais=fm.get("semanas_atuais"),
+        semanas_atuais=semanas_final,
         tipo_gestacao=fm.get("tipo_gestacao"),
         risco=fm.get("risco"),
-        data_provavel_parto=str(fm.get("data_provavel_parto")) if fm.get("data_provavel_parto") else None,
+        data_provavel_parto=dpp_final,
         alergias=_list("alergias"),
         condicoes_pre_existentes=_list("condicoes_pre_existentes"),
         medicacoes_em_uso=_list("medicacoes_em_uso"),
@@ -301,6 +343,21 @@ async def append_conversation(
             log.exception("falha ao commitar/push da conversa de %s", phone)
 
 
+async def commit_and_push(message: str) -> None:
+    """Commita tudo que estiver staged/modificado no vault e faz push.
+    Usado pelas rotas de admin que escrevem direto no markdown.
+    """
+    if not _is_enabled():
+        return
+    async with _lock:
+        try:
+            _run_git(["add", "-A"], cwd=_vault_path())
+            _run_git(["commit", "-m", message], cwd=_vault_path(), check=False)
+            _run_git(["push"], cwd=_vault_path())
+        except Exception:
+            log.exception("commit_and_push falhou: %s", message)
+
+
 async def ensure_stub(phone: str, *, name_hint: str | None = None) -> None:
     """Cria pacientes/<phone>/anamnese.md stub se ainda não existir.
 
@@ -324,9 +381,8 @@ telefone: "{phone}"
 data_nascimento:
 endereco: ""
 
+# DUM é a única fonte da verdade — semanas e DPP são calculados dinamicamente
 dum:
-data_provavel_parto:
-semanas_atuais:
 tipo_gestacao:
 risco:
 gestacao_planejada:

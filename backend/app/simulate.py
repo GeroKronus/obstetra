@@ -25,14 +25,24 @@ class SimulateRequest(BaseModel):
     text: str
 
 
+class EscalationInfo(BaseModel):
+    motivo: str
+    resumo: str
+    notified_doctor: bool
+
+
 class SimulateResponse(BaseModel):
     messages_to_patient: list[str]
     messages_to_doctor: list[str]
+    escalation_this_turn: EscalationInfo | None
     patient_state: dict
 
 
 @router.post("/simulate", response_model=SimulateResponse)
 async def simulate(req: SimulateRequest) -> SimulateResponse:
+    from sqlmodel import select
+    from .models import Escalation
+
     log.info("simulate inbound from=%s text=%r", req.phone, req.text[:120])
 
     with Session(engine) as db:
@@ -43,6 +53,11 @@ async def simulate(req: SimulateRequest) -> SimulateResponse:
             text=req.text,
         ))
         db.commit()
+
+        # Marca o numero de Escalation antes do turno pra detectar quais foram criadas
+        prior_escalation_count = len(
+            db.exec(select(Escalation).where(Escalation.patient_id == patient.id)).all()
+        )
 
         provider = BufferedProvider()
         agent = get_agent()
@@ -57,6 +72,21 @@ async def simulate(req: SimulateRequest) -> SimulateResponse:
         to_patient = [t for (p, t) in provider.sent if p == req.phone]
         to_doctor = [t for (p, t) in provider.sent if doctor_phone and p == doctor_phone]
 
+        # Pega a escalada criada neste turno (se houver)
+        escalations = db.exec(
+            select(Escalation)
+            .where(Escalation.patient_id == patient.id)
+            .order_by(Escalation.created_at.desc())
+        ).all()
+        escalation_this_turn: EscalationInfo | None = None
+        if len(escalations) > prior_escalation_count:
+            latest = escalations[0]
+            escalation_this_turn = EscalationInfo(
+                motivo=latest.reason,
+                resumo=latest.summary,
+                notified_doctor=latest.notified_doctor,
+            )
+
         db.refresh(patient)
         state = {
             "phone": patient.phone,
@@ -69,6 +99,7 @@ async def simulate(req: SimulateRequest) -> SimulateResponse:
     return SimulateResponse(
         messages_to_patient=to_patient,
         messages_to_doctor=to_doctor,
+        escalation_this_turn=escalation_this_turn,
         patient_state=state,
     )
 

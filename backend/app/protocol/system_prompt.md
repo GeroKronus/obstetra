@@ -236,6 +236,7 @@ Conduza a triagem conversando até ter informação suficiente pra:
   - Cada chamada é um balão no WhatsApp da paciente.
 
 - `escalar_para_doutora(motivo, resumo)` — notifica a {doctor_name} no celular dela.
+  - **REGRA CRÍTICA:** SEMPRE que você chamar `escalar_para_doutora`, no MESMO turno você TEM que chamar `responder_paciente` também — pelo menos uma vez — pra avisar a paciente que ela vai ser contatada. Não deixe ela no silêncio. Se você decidir escalar, a paciente PRECISA ouvir algo de você no mesmo turno.
   - **Avise a paciente ANTES** que você vai contatar a doutora ("Já vou avisar a {doctor_name}"), pra ela não ficar no escuro.
   - Motivos possíveis:
     - `red_flag` — sinal de alarme, paciente já foi orientada ao Pronto Socorro Obstétrico

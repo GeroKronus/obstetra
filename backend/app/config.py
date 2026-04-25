@@ -27,5 +27,9 @@ class Settings(BaseSettings):
     # Quanto tempo (segundos) o cache local do vault é considerado fresco antes de um novo pull
     vault_pull_max_age_s: int = 30
 
+    # Admin web (rota /admin) — usuário/senha pra secretária
+    admin_user: str = ""
+    admin_password: str = ""
+
 
 settings = Settings()

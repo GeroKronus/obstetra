@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import vault
+from .admin import router as admin_router
 from .config import settings
 from .db import init_db
 from .simulate import router as simulate_router
@@ -30,6 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Obstetra", lifespan=lifespan)
 app.include_router(webhook_router)
 app.include_router(simulate_router)
+app.include_router(admin_router)
 
 
 @app.get("/health")

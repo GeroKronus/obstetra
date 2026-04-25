@@ -1,0 +1,39 @@
+{% extends "admin/base.html" %}
+{% block title %}Pacientes — Obstetra{% endblock %}
+{% block content %}
+<h1>Pacientes</h1>
+{% if request.query_params.get("ok") %}
+<div class="alert ok">Paciente <strong>{{ request.query_params.get("ok") }}</strong> salva com sucesso.</div>
+{% endif %}
+
+{% if patients %}
+<table>
+    <thead>
+        <tr>
+            <th>Nome</th>
+            <th>Telefone</th>
+            <th>Semanas</th>
+            <th>Tipo</th>
+            <th>Risco</th>
+            <th></th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for p in patients %}
+        <tr>
+            <td><strong>{{ p.nome }}</strong></td>
+            <td>{{ p.phone }}</td>
+            <td>{{ p.semanas if p.semanas is not none else "—" }}</td>
+            <td>{{ p.tipo }}</td>
+            <td>
+                <span class="badge badge-{{ p.risco }}">{{ p.risco }}</span>
+            </td>
+            <td><a href="/admin/{{ p.phone }}">Editar →</a></td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>Nenhuma paciente cadastrada ainda. <a href="/admin/novo">Cadastrar a primeira →</a></p>
+{% endif %}
+{% endblock %}

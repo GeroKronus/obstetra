@@ -177,13 +177,37 @@ class ClinicalAgent:
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
-                # Agente parou sem chamar tools — não envia nada à paciente.
-                # Isso só deve acontecer se o prompt falhou; loga e encerra.
-                log.warning(
-                    "agent ended turn without tool calls for patient=%s stop=%s",
-                    patient.phone,
-                    response.stop_reason,
-                )
+                # Fallback: o modelo às vezes termina o turno sem chamar a tool,
+                # mas ainda gera texto. Envia esse texto como responder_paciente
+                # pra paciente não ficar no silêncio.
+                text_blocks = [
+                    b.text for b in response.content
+                    if getattr(b, "type", None) == "text" and getattr(b, "text", "").strip()
+                ]
+                if text_blocks:
+                    log.warning(
+                        "agent fallback — gerou texto sem tool call (patient=%s, %d blocos)",
+                        patient.phone, len(text_blocks),
+                    )
+                    for text in text_blocks:
+                        text = text.strip()
+                        try:
+                            msg_id = await provider.send_text(patient.phone, text)
+                            outbound_msgs_this_turn.append(text)
+                            db.add(Message(
+                                patient_id=patient.id,
+                                direction=MessageDirection.OUTBOUND,
+                                text=text,
+                                whatsapp_message_id=msg_id or None,
+                            ))
+                            db.commit()
+                        except Exception:
+                            log.exception("fallback send_text falhou")
+                else:
+                    log.warning(
+                        "agent ended turn sem tool call e sem texto (patient=%s stop=%s)",
+                        patient.phone, response.stop_reason,
+                    )
                 break
 
             messages.append({"role": "assistant", "content": response.content})
@@ -236,6 +260,30 @@ class ClinicalAgent:
                 MAX_TOOL_ITERATIONS,
                 patient.phone,
             )
+
+        # Se o agente chamou escalar_para_doutora mas não falou nada pra paciente,
+        # manda um ack de cortesia pra ela não ficar no silêncio
+        if escalation_info and not outbound_msgs_this_turn:
+            fallback_text = (
+                "Vou registrar essa dúvida pra Dra. Leiza te responder. "
+                "Qualquer coisa nova ou se algo piorar, me avisa na hora, tá?"
+            )
+            log.warning(
+                "agent escalou sem responder à paciente — enviando ack default (patient=%s)",
+                patient.phone,
+            )
+            try:
+                msg_id = await provider.send_text(patient.phone, fallback_text)
+                outbound_msgs_this_turn.append(fallback_text)
+                db.add(Message(
+                    patient_id=patient.id,
+                    direction=MessageDirection.OUTBOUND,
+                    text=fallback_text,
+                    whatsapp_message_id=msg_id or None,
+                ))
+                db.commit()
+            except Exception:
+                log.exception("escalation-only fallback send failed")
 
         patient.updated_at = utcnow()
         db.add(patient)
