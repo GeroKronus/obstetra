@@ -82,6 +82,20 @@ def _date_str(value: Any) -> str:
     return str(value)
 
 
+def _parse_dum(value: Any) -> date | None:
+    """Aceita date, datetime ou string ISO 'YYYY-MM-DD'."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _extract_section(body: str, heading: str) -> str:
     if not body:
         return ""
@@ -146,12 +160,15 @@ def _load_patient(phone: str) -> dict | None:
 def _build_anamnese_md(data: dict) -> str:
     """Monta o markdown completo (frontmatter + body) a partir do dict da requisição."""
     now = datetime.now().isoformat(timespec="seconds")
+    # Converte datas pra objeto date — assim PyYAML escreve sem aspas
+    # (ex: 'dum: 2025-10-08' em vez de "dum: '2025-10-08'"), o que faz a
+    # leitura subsequente funcionar transparentemente.
     fm = {
         "nome": data["nome"],
         "telefone": data["telefone"],
-        "data_nascimento": data["data_nascimento"] or None,
+        "data_nascimento": _parse_dum(data["data_nascimento"]) if data["data_nascimento"] else None,
         "endereco": data["endereco"],
-        "dum": data["dum"] or None,
+        "dum": _parse_dum(data["dum"]) if data["dum"] else None,
         "tipo_gestacao": data["tipo_gestacao"],
         "risco": data["risco"],
         "gestacao_planejada": data["gestacao_planejada"],
@@ -260,14 +277,11 @@ async def admin_index(
                 if query not in blob:
                     continue
 
-            dum = fm.get("dum")
+            dum = _parse_dum(fm.get("dum"))
             semanas: int | None = None
             if dum:
-                if isinstance(dum, datetime):
-                    dum = dum.date()
-                if isinstance(dum, date):
-                    delta = (date.today() - dum).days
-                    semanas = delta // 7 if delta >= 0 else None
+                delta = (date.today() - dum).days
+                semanas = delta // 7 if delta >= 0 else None
 
             patients.append({
                 "phone": d.name,
