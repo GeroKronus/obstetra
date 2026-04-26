@@ -25,6 +25,10 @@ class Patient(SQLModel, table=True):
     gestational_weeks: Optional[int] = None
     is_doctor_patient: Optional[bool] = None
     onboarding_state: OnboardingState = Field(default=OnboardingState.NEW)
+    # Quando a Dra. assume manualmente o atendimento (digita no WhatsApp do bot),
+    # esse campo recebe a hora do takeover. Enquanto != None, o agente fica silencioso.
+    # É limpo quando alguma mensagem é classificada como "fim de conversa" pelo Haiku.
+    manual_handover_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -34,12 +38,19 @@ class MessageDirection(str, Enum):
     OUTBOUND = "outbound"
 
 
+class MessageSource(str, Enum):
+    BOT = "bot"           # outbound enviado pelo agente via API
+    MANUAL = "manual"     # outbound digitado manualmente no WhatsApp do bot (Dra. assumiu)
+    PATIENT = "patient"   # inbound da paciente
+
+
 class Message(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     patient_id: int = Field(foreign_key="patient.id", index=True)
     direction: MessageDirection
     text: str
     whatsapp_message_id: Optional[str] = Field(default=None, index=True)
+    source: MessageSource = Field(default=MessageSource.BOT)
     created_at: datetime = Field(default_factory=utcnow, index=True)
 
 
