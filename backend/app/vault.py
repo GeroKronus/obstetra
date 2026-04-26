@@ -152,6 +152,10 @@ class PatientContext:
     historico_clinico: str | None = None
     historico_obstetrico: str | None = None
     observacoes_dra: str | None = None
+    hospital_referencia: str | None = None
+    contato_emergencia_nome: str | None = None
+    contato_emergencia_telefone: str | None = None
+    contato_emergencia_relacao: str | None = None
 
     def to_prompt_block(self) -> str:
         """Renderiza como bloco XML-style pro prompt do agente."""
@@ -169,6 +173,16 @@ class PatientContext:
             lines.append(f"  condicoes_pre_existentes: {', '.join(self.condicoes_pre_existentes)}")
         if self.medicacoes_em_uso:
             lines.append(f"  medicacoes_em_uso: {', '.join(self.medicacoes_em_uso)}")
+        if self.hospital_referencia:
+            lines.append(f"  hospital_referencia: {self.hospital_referencia}")
+        if self.contato_emergencia_nome or self.contato_emergencia_telefone:
+            lines.append("  contato_emergencia:")
+            if self.contato_emergencia_nome:
+                lines.append(f"    nome: {self.contato_emergencia_nome}")
+            if self.contato_emergencia_relacao:
+                lines.append(f"    relacao: {self.contato_emergencia_relacao}")
+            if self.contato_emergencia_telefone:
+                lines.append(f"    telefone: {self.contato_emergencia_telefone}")
         if self.preferencias_atendimento: lines.append(f"  preferencias: {self.preferencias_atendimento}")
         if self.observacoes_dra:
             lines.append("  observacoes_da_doutora: |")
@@ -292,6 +306,10 @@ async def read_patient(phone: str) -> PatientContext:
         historico_clinico=_extract_section(body, "Histórico clínico relevante"),
         historico_obstetrico=_extract_section(body, "Histórico obstétrico"),
         observacoes_dra=_extract_section(body, "Observações pessoais da Dra."),
+        hospital_referencia=fm.get("hospital_referencia") or None,
+        contato_emergencia_nome=fm.get("contato_emergencia_nome") or None,
+        contato_emergencia_telefone=fm.get("contato_emergencia_telefone") or None,
+        contato_emergencia_relacao=fm.get("contato_emergencia_relacao") or None,
     )
 
 

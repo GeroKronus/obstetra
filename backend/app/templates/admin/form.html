@@ -110,6 +110,25 @@
     </fieldset>
 
     <fieldset>
+        <legend>Contato de emergência</legend>
+        <p class="hint" style="margin-top: 0">Pessoa que deve ser acionada em urgências envolvendo a paciente — geralmente marido, mãe, irmã ou outro responsável próximo. O bot menciona esse contato quando relevante (ex: "se quiser, posso te ajudar a avisar o Daniel?").</p>
+        <div class="row">
+            <label>
+                <span>Nome</span>
+                <input type="text" name="contato_emergencia_nome" placeholder="Daniel" value="{{ (patient.contato_emergencia_nome if patient else '')|e }}">
+            </label>
+            <label>
+                <span>Relação</span>
+                <input type="text" name="contato_emergencia_relacao" placeholder="marido, mãe, irmã…" value="{{ (patient.contato_emergencia_relacao if patient else '')|e }}">
+            </label>
+        </div>
+        <label>
+            <span>Telefone <em class="hint">(E.164 sem +)</em></span>
+            <input type="tel" name="contato_emergencia_telefone" pattern="\d{10,15}" placeholder="5511988887777" value="{{ (patient.contato_emergencia_telefone if patient else '')|e }}">
+        </label>
+    </fieldset>
+
+    <fieldset>
         <legend>Observações em texto livre <em class="hint" style="font-weight: normal">(o bot lê tudo isso pra contextualizar)</em></legend>
         <label>
             <span>Histórico clínico relevante</span>
