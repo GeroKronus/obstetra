@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Request
 from sqlmodel import Session, select
 
-from . import classifier
+from . import classifier, vision
 from .agent import get_agent
 from .config import settings
 from .db import engine
@@ -37,6 +37,56 @@ def _extract_text(message: dict[str, Any]) -> str | None:
     if ext and "text" in ext:
         return ext["text"]
     return None
+
+
+# Detecção de mídia que o bot não processa (audio, imagem, PDF etc.)
+_MEDIA_TYPES = {
+    "audioMessage": "audio",
+    "pttMessage": "audio",   # push-to-talk — mensagem de voz
+    "imageMessage": "imagem",
+    "videoMessage": "video",
+    "documentMessage": "documento",
+    "stickerMessage": "figurinha",
+    "locationMessage": "localizacao",
+    "contactMessage": "contato",
+    "contactsArrayMessage": "contato",
+}
+
+
+def _detect_media_type(message: dict[str, Any]) -> str | None:
+    """Retorna o tipo de mídia (audio/imagem/etc.) ou None se for texto/desconhecido."""
+    if not message:
+        return None
+    for key, label in _MEDIA_TYPES.items():
+        if key in message:
+            return label
+    return None
+
+
+def _media_rejection_text(media_type: str) -> str:
+    if media_type == "audio":
+        return (
+            "Oi! Vi que você me mandou uma mensagem de voz. "
+            "Não tenho como escutar áudios — se você puder me escrever em texto "
+            "o que está acontecendo, eu te ajudo na hora."
+        )
+    if media_type == "imagem":
+        return (
+            "Oi! Recebi sua imagem, mas não tenho como analisar fotos por aqui. "
+            "Se for algo importante (foto de exame, receita, sintoma visível), "
+            "me conta em texto o que é, ou aguarda que vou repassar à Dra. Leiza."
+        )
+    if media_type == "documento":
+        return (
+            "Oi! Recebi seu documento, mas não tenho como ler arquivos por aqui. "
+            "Se for algo urgente, me descreve em texto que eu te ajudo. "
+            "Senão, vou repassar à Dra. Leiza pra ela ver."
+        )
+    # video, figurinha, localizacao, contato — resposta genérica
+    return (
+        "Oi! Não tenho como processar esse tipo de mensagem por aqui — só texto. "
+        "Se puder me escrever o que precisa, eu te ajudo."
+    )
 
 
 def _get_or_create_patient(db: Session, phone: str) -> Patient:
@@ -121,6 +171,125 @@ async def _process_message(phone: str, text: str, whatsapp_message_id: str | Non
             )
         finally:
             await provider.aclose()
+
+
+async def _handle_unsupported_media(
+    phone: str,
+    media_type: str,
+    whatsapp_message_id: str | None,
+) -> None:
+    """Para audio/PDF/video/etc. — responde explicando que so processa texto.
+    (Imagem nao passa por aqui; tem caminho proprio via vision.)"""
+    with Session(engine) as db:
+        patient = _get_or_create_patient(db, phone)
+
+        db.add(Message(
+            patient_id=patient.id,
+            direction=MessageDirection.INBOUND,
+            text=f"[{media_type} recebido — bot nao processa]",
+            whatsapp_message_id=whatsapp_message_id,
+            source=MessageSource.PATIENT,
+        ))
+        db.commit()
+
+        if patient.manual_handover_at is not None:
+            log.info("midia (%s) em takeover — bot silente", media_type)
+            return
+
+        rejection = _media_rejection_text(media_type)
+        provider = EvolutionProvider()
+        try:
+            msg_id = await provider.send_text(phone, rejection)
+            db.add(Message(
+                patient_id=patient.id,
+                direction=MessageDirection.OUTBOUND,
+                text=rejection,
+                whatsapp_message_id=msg_id or None,
+                source=MessageSource.BOT,
+            ))
+            db.commit()
+        finally:
+            await provider.aclose()
+
+
+async def _handle_image_message(
+    phone: str,
+    full_data: dict,
+    caption: str,
+    whatsapp_message_id: str | None,
+) -> None:
+    """Quando paciente manda imagem: baixa do Evolution, descreve via Haiku Vision,
+    e passa a descricao + legenda como texto pro agente principal Opus 4.7.
+
+    Respeita takeover (Dra. ve a foto direto no WhatsApp dela)."""
+    with Session(engine) as db:
+        patient = _get_or_create_patient(db, phone)
+
+        marker_text = f"[imagem recebida{(' — legenda: ' + caption) if caption else ''}]"
+        db.add(Message(
+            patient_id=patient.id,
+            direction=MessageDirection.INBOUND,
+            text=marker_text,
+            whatsapp_message_id=whatsapp_message_id,
+            source=MessageSource.PATIENT,
+        ))
+        db.commit()
+
+        if patient.manual_handover_at is not None:
+            log.info("imagem em takeover (%s) — bot silente, Dra. ve direto", phone)
+            return
+
+        provider = EvolutionProvider()
+        try:
+            media = await provider.download_media_base64(full_data)
+            if not media:
+                log.warning("falha ao baixar imagem de %s — fallback rejeicao", phone)
+                rejection = _media_rejection_text("imagem")
+                msg_id = await provider.send_text(phone, rejection)
+                db.add(Message(
+                    patient_id=patient.id,
+                    direction=MessageDirection.OUTBOUND,
+                    text=rejection,
+                    whatsapp_message_id=msg_id or None,
+                    source=MessageSource.BOT,
+                ))
+                db.commit()
+                return
+
+            base64_data, mimetype = media
+            description = await vision.describe_image(base64_data, mimetype)
+            if not description:
+                description = "(nao foi possivel descrever a imagem)"
+
+            # Sintese: o que a paciente "disse" do ponto de vista do agente
+            parts = ["[Paciente acabou de enviar uma imagem.]"]
+            if caption:
+                parts.append(f"Legenda da paciente: \"{caption}\"")
+            parts.append(f"Descricao factual da imagem (gerada por IA, nao interprete clinicamente sem cautela): {description}")
+            synthetic_text = "\n".join(parts)
+
+            agent = get_agent()
+            await agent.handle_inbound(
+                patient=patient,
+                inbound_text=synthetic_text,
+                provider=provider,
+                db=db,
+            )
+        finally:
+            await provider.aclose()
+
+
+def _extract_caption(message: dict[str, Any]) -> str:
+    """Extrai legenda de imagem/video/documento, se houver."""
+    if not message:
+        return ""
+    for key in ("imageMessage", "videoMessage", "documentMessage"):
+        m = message.get(key)
+        if m and isinstance(m, dict):
+            cap = m.get("caption")
+            if cap:
+                return cap.strip()
+    return ""
 
 
 async def _process_doctor_message(text: str) -> None:
@@ -225,7 +394,23 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> dict
 
     # ===== Mensagem inbound de uma paciente =====
     if not text:
-        log.info("received non-text message from %s — ignoring for MVP", phone)
+        message_obj = data.get("message") or {}
+        media_type = _detect_media_type(message_obj)
+
+        # Imagem tem caminho próprio: passa pelo Claude Vision (Haiku) antes do agente
+        if media_type == "imagem":
+            caption = _extract_caption(message_obj)
+            log.info("paciente %s mandou imagem (caption=%r) — vision pipeline", phone, caption[:60])
+            background.add_task(_handle_image_message, phone, data, caption, msg_id)
+            return {"received": True, "phone": phone, "media_type": "imagem"}
+
+        # Outros tipos (audio, video, PDF, etc.) — rejeição educada por enquanto
+        if media_type:
+            log.info("paciente %s mandou %s — bot vai responder pedindo texto", phone, media_type)
+            background.add_task(_handle_unsupported_media, phone, media_type, msg_id)
+            return {"received": True, "phone": phone, "media_type": media_type}
+
+        log.info("received unknown non-text message from %s — ignoring", phone)
         return {"ignored": "non-text"}
 
     log.info("inbound from=%s text=%r", phone, text[:120])

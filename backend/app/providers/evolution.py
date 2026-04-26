@@ -51,5 +51,30 @@ class EvolutionProvider(WhatsAppProvider):
         except httpx.HTTPError as exc:
             log.warning("markRead failed for %s: %s", phone, exc)
 
+    async def download_media_base64(self, message_payload: dict) -> tuple[str, str] | None:
+        """Baixa midia (imagem/audio/etc.) de uma mensagem ja recebida pelo webhook.
+        Retorna (base64, mimetype) ou None em caso de falha."""
+        url = f"{self.base_url}/chat/getBase64FromMediaMessage/{self.instance}"
+        body = {
+            "message": {
+                "key": message_payload.get("key"),
+                "message": message_payload.get("message"),
+            },
+            "convertToMp4": False,
+        }
+        try:
+            resp = await self._client.post(url, json=body, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.json()
+            b64 = data.get("base64") or ""
+            mime = data.get("mimetype") or "image/jpeg"
+            if not b64:
+                log.warning("getBase64FromMediaMessage retornou vazio: %s", data)
+                return None
+            return b64, mime
+        except Exception as exc:
+            log.exception("download_media_base64 falhou: %s", exc)
+            return None
+
     async def aclose(self) -> None:
         await self._client.aclose()
