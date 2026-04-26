@@ -9,6 +9,7 @@ from .config import settings
 from .db import engine, get_session
 from .models import Message, MessageDirection, OnboardingState, Patient
 from .providers.evolution import EvolutionProvider
+from .relay import get_relay_agent
 
 log = logging.getLogger("obstetra.webhook")
 
@@ -68,6 +69,17 @@ async def _process_message(phone: str, text: str, whatsapp_message_id: str | Non
             await provider.aclose()
 
 
+async def _process_doctor_message(text: str) -> None:
+    """Processa mensagens vindas do telefone da doutora via relay agent."""
+    with Session(engine) as db:
+        provider = EvolutionProvider()
+        try:
+            agent = get_relay_agent()
+            await agent.handle_doctor_message(text=text, provider=provider, db=db)
+        finally:
+            await provider.aclose()
+
+
 @router.post("/webhook")
 async def receive_webhook(request: Request, background: BackgroundTasks) -> dict:
     payload = await request.json()
@@ -88,12 +100,16 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> dict
 
     phone = remote_jid.split("@", 1)[0]
 
-    # Ignora mensagens vindas do telefone da doutora — sao respostas dela
-    # as escaladas, nao mensagens de pacientes. Sem essa guarda, a doutora
-    # cairia no fluxo de onboarding como se fosse paciente nova.
+    # Mensagens vindas do telefone da doutora vão pro relay agent
+    # (encaminhar resposta dela à paciente, pedir clarificação, etc.)
     if settings.doctor_phone_number and phone == settings.doctor_phone_number:
-        log.info("ignoring inbound from doctor's phone (%s) — not a patient", phone)
-        return {"ignored": "from-doctor"}
+        text = _extract_text(data.get("message") or {})
+        if not text:
+            log.info("doctor inbound non-text — ignoring for MVP")
+            return {"ignored": "doctor-non-text"}
+        log.info("inbound from DOCTOR text=%r", text[:120])
+        background.add_task(_process_doctor_message, text)
+        return {"received": True, "from": "doctor"}
 
     text = _extract_text(data.get("message") or {})
     if not text:
