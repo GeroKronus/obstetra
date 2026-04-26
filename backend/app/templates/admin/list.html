@@ -10,12 +10,35 @@
 
 <div class="list-toolbar">
     <h1 style="margin: 0;">Pacientes</h1>
-    {% if patients %}
+    {% if total %}
     <span class="list-count" aria-live="polite">
-        {{ patients|length }} cadastrada{{ 's' if patients|length != 1 else '' }}
+        {% if q %}
+            {{ patients|length }} de {{ total }}
+        {% else %}
+            {{ total }} cadastrada{{ 's' if total != 1 else '' }}
+        {% endif %}
     </span>
     {% endif %}
 </div>
+
+<form method="GET" action="/admin/" role="search" class="search-form">
+    <label for="search-q" class="visually-hidden">Buscar paciente</label>
+    <div class="search-wrap">
+        <span class="search-icon" aria-hidden="true">🔍</span>
+        <input
+            id="search-q"
+            type="search"
+            name="q"
+            value="{{ q|e }}"
+            placeholder="Buscar por nome, telefone, cidade, contato, condição…"
+            autocomplete="off"
+            inputmode="search"
+        >
+        {% if q %}
+        <a href="/admin/" class="search-clear" aria-label="Limpar busca">×</a>
+        {% endif %}
+    </div>
+</form>
 
 {% if patients %}
 <ul class="patient-list" role="list">
@@ -45,6 +68,12 @@
     </li>
     {% endfor %}
 </ul>
+{% elif q %}
+<div class="empty-state">
+    <h3>Nenhum resultado pra "{{ q }}"</h3>
+    <p>Tente buscar por outro trecho — nome, telefone, contato de emergência, hospital, etc.</p>
+    <a href="/admin/" class="btn primary">Limpar busca</a>
+</div>
 {% else %}
 <div class="empty-state">
     <h3>Nenhuma paciente cadastrada</h3>

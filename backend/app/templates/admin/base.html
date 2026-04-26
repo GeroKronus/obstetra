@@ -417,6 +417,68 @@
             font-weight: 500;
         }
 
+        /* ----- BUSCA ----- */
+        .visually-hidden {
+            position: absolute;
+            width: 1px; height: 1px;
+            padding: 0; margin: -1px;
+            overflow: hidden; clip: rect(0,0,0,0);
+            white-space: nowrap; border: 0;
+        }
+        .search-form {
+            margin: 0 0 1rem;
+        }
+        .search-wrap {
+            position: relative;
+            display: flex;
+            align-items: center;
+        }
+        .search-wrap input[type=search] {
+            width: 100%;
+            padding: 0.7rem 0.7rem 0.7rem 2.5rem;
+            font-size: 1rem;
+            font-family: inherit;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            background: var(--bg-card);
+            color: var(--text);
+            min-height: var(--tap);
+            box-shadow: var(--shadow-sm);
+            transition: border-color 0.15s, box-shadow 0.15s;
+        }
+        .search-wrap input[type=search]:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px var(--primary-ring);
+        }
+        .search-wrap input[type=search]::-webkit-search-cancel-button { display: none; }
+        .search-icon {
+            position: absolute;
+            left: 0.85rem;
+            font-size: 0.95rem;
+            color: var(--muted);
+            pointer-events: none;
+        }
+        .search-clear {
+            position: absolute;
+            right: 0.5rem;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2rem;
+            height: 2rem;
+            border-radius: 50%;
+            color: var(--muted);
+            text-decoration: none;
+            font-size: 1.25rem;
+            line-height: 1;
+            transition: background 0.15s, color 0.15s;
+        }
+        .search-clear:hover {
+            background: var(--bg-soft);
+            color: var(--text);
+        }
+
         .patient-list {
             display: flex;
             flex-direction: column;

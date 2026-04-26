@@ -191,16 +191,52 @@ def _clean_phone(raw: str) -> str | None:
     return digits
 
 
+def _build_search_blob(fm: dict, body: str) -> str:
+    """Concatena todos os campos pesquisaveis num unico string normalizado em lowercase."""
+    parts: list[str] = []
+
+    def _add(value):
+        if not value:
+            return
+        if isinstance(value, list):
+            parts.extend(str(v) for v in value if v)
+        else:
+            parts.append(str(value))
+
+    for key in (
+        "nome", "telefone", "data_nascimento", "endereco",
+        "tipo_gestacao", "risco", "grupo_sanguineo",
+        "alergias", "condicoes_pre_existentes", "medicacoes_em_uso",
+        "medico_obstetra", "hospital_referencia", "plano_saude",
+        "contato_emergencia_nome", "contato_emergencia_telefone",
+        "contato_emergencia_relacao",
+        "preferencias_atendimento", "status",
+    ):
+        _add(fm.get(key))
+
+    if body:
+        parts.append(body)
+
+    return " ".join(parts).lower()
+
+
 @router.get("/", response_class=HTMLResponse)
-async def admin_index(request: Request, _: str = Depends(verify_admin)):
+async def admin_index(
+    request: Request,
+    q: str = "",
+    _: str = Depends(verify_admin),
+):
     # Pull antes de listar pra ter dados frescos
     try:
         await vault_module._pull_if_stale()
     except Exception:
         log.exception("pull no /admin/ falhou — listando do cache local")
 
+    query = (q or "").strip().lower()
     pacientes_dir = _vault_pacientes_path()
     patients: list[dict] = []
+    total = 0
+
     if pacientes_dir.exists():
         for d in sorted(pacientes_dir.iterdir()):
             if not d.is_dir():
@@ -211,31 +247,41 @@ async def admin_index(request: Request, _: str = Depends(verify_admin)):
             try:
                 post = frontmatter.load(anamnese)
                 fm = post.metadata or {}
-                dum = fm.get("dum")
-                semanas: int | None = None
-                if dum:
-                    if isinstance(dum, datetime):
-                        dum = dum.date()
-                    if isinstance(dum, date):
-                        delta = (date.today() - dum).days
-                        semanas = delta // 7 if delta >= 0 else None
-                patients.append(
-                    {
-                        "phone": d.name,
-                        "nome": fm.get("nome") or d.name,
-                        "semanas": semanas,
-                        "tipo": fm.get("tipo_gestacao", "-"),
-                        "risco": fm.get("risco", "-"),
-                        "status": fm.get("status", "ativa"),
-                    }
-                )
+                body = post.content or ""
             except Exception:
                 log.exception("erro lendo %s", anamnese)
+                continue
+
+            total += 1
+
+            # Filtra ANTES de montar o card (evita custo de renderizar o que vai sumir)
+            if query:
+                blob = _build_search_blob(fm, body)
+                if query not in blob:
+                    continue
+
+            dum = fm.get("dum")
+            semanas: int | None = None
+            if dum:
+                if isinstance(dum, datetime):
+                    dum = dum.date()
+                if isinstance(dum, date):
+                    delta = (date.today() - dum).days
+                    semanas = delta // 7 if delta >= 0 else None
+
+            patients.append({
+                "phone": d.name,
+                "nome": fm.get("nome") or d.name,
+                "semanas": semanas,
+                "tipo": fm.get("tipo_gestacao", "-"),
+                "risco": fm.get("risco", "-"),
+                "status": fm.get("status", "ativa"),
+            })
 
     return templates.TemplateResponse(
         request,
         "admin/list.html",
-        {"patients": patients},
+        {"patients": patients, "q": q, "total": total},
     )
 
 
