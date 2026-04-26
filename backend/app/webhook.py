@@ -5,6 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from sqlmodel import Session, select
 
 from .agent import get_agent
+from .config import settings
 from .db import engine, get_session
 from .models import Message, MessageDirection, OnboardingState, Patient
 from .providers.evolution import EvolutionProvider
@@ -86,6 +87,14 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> dict
         return {"ignored": "non-dm"}
 
     phone = remote_jid.split("@", 1)[0]
+
+    # Ignora mensagens vindas do telefone da doutora — sao respostas dela
+    # as escaladas, nao mensagens de pacientes. Sem essa guarda, a doutora
+    # cairia no fluxo de onboarding como se fosse paciente nova.
+    if settings.doctor_phone_number and phone == settings.doctor_phone_number:
+        log.info("ignoring inbound from doctor's phone (%s) — not a patient", phone)
+        return {"ignored": "from-doctor"}
+
     text = _extract_text(data.get("message") or {})
     if not text:
         log.info("received non-text message from %s — ignoring for MVP", phone)
