@@ -1,39 +1,45 @@
 {% extends "admin/base.html" %}
 {% block title %}{{ "Editar" if patient else "Nova" }} paciente — Obstetra{% endblock %}
 {% block content %}
+
 <h1>{{ "Editar paciente" if patient else "Cadastrar nova paciente" }}</h1>
 
-{% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
 
-<form method="POST" autocomplete="off">
+<form method="POST" autocomplete="off" novalidate>
     <fieldset>
         <legend>Identificação</legend>
         <label>
             <span>Nome completo *</span>
-            <input type="text" name="nome" required value="{{ (patient.nome if patient else '')|e }}">
+            <input type="text" name="nome" required autocomplete="name"
+                   value="{{ (patient.nome if patient else '')|e }}">
         </label>
         <div class="row">
             <label>
                 <span>Telefone (E.164 sem +) *</span>
                 <input type="tel" name="telefone" required pattern="\d{10,15}"
+                       inputmode="numeric" autocomplete="tel"
                        placeholder="5511999990001"
                        value="{{ (patient.telefone if patient else '')|e }}"
                        {% if phone_lock %}readonly title="Telefone não pode ser alterado após cadastro"{% endif %}>
+                {% if phone_lock %}<p class="hint">Telefone bloqueado após cadastro.</p>{% endif %}
             </label>
             <label>
                 <span>Data de nascimento</span>
-                <input type="date" name="data_nascimento" value="{{ patient.data_nascimento if patient else '' }}">
+                <input type="date" name="data_nascimento" autocomplete="bday"
+                       value="{{ patient.data_nascimento if patient else '' }}">
             </label>
         </div>
         <label>
             <span>Endereço</span>
-            <input type="text" name="endereco" value="{{ (patient.endereco if patient else '')|e }}">
+            <input type="text" name="endereco" autocomplete="street-address"
+                   value="{{ (patient.endereco if patient else '')|e }}">
         </label>
     </fieldset>
 
     <fieldset>
         <legend>Gestação atual</legend>
-        <div class="row">
+        <div class="row row-3">
             <label>
                 <span>DUM (data da última menstruação)</span>
                 <input type="date" name="dum" value="{{ patient.dum if patient else '' }}">
@@ -65,11 +71,27 @@
 
     <fieldset>
         <legend>Histórico obstétrico (G/P/A)</legend>
-        <div class="row">
-            <label><span>Gestas</span><input type="number" name="gestas" min="0" value="{{ patient.gestas if patient else 0 }}"></label>
-            <label><span>Partos normais</span><input type="number" name="partos_normais" min="0" value="{{ patient.partos_normais if patient else 0 }}"></label>
-            <label><span>Cesáreas</span><input type="number" name="cesareas" min="0" value="{{ patient.cesareas if patient else 0 }}"></label>
-            <label><span>Abortos</span><input type="number" name="abortos" min="0" value="{{ patient.abortos if patient else 0 }}"></label>
+        <div class="row row-4">
+            <label>
+                <span>Gestas</span>
+                <input type="number" name="gestas" min="0" inputmode="numeric"
+                       value="{{ patient.gestas if patient else 0 }}">
+            </label>
+            <label>
+                <span>Partos normais</span>
+                <input type="number" name="partos_normais" min="0" inputmode="numeric"
+                       value="{{ patient.partos_normais if patient else 0 }}">
+            </label>
+            <label>
+                <span>Cesáreas</span>
+                <input type="number" name="cesareas" min="0" inputmode="numeric"
+                       value="{{ patient.cesareas if patient else 0 }}">
+            </label>
+            <label>
+                <span>Abortos</span>
+                <input type="number" name="abortos" min="0" inputmode="numeric"
+                       value="{{ patient.abortos if patient else 0 }}">
+            </label>
         </div>
     </fieldset>
 
@@ -89,7 +111,8 @@
         </label>
         <label>
             <span>Grupo sanguíneo</span>
-            <input type="text" name="grupo_sanguineo" placeholder="A+" value="{{ (patient.grupo_sanguineo if patient else '')|e }}">
+            <input type="text" name="grupo_sanguineo" placeholder="A+"
+                   value="{{ (patient.grupo_sanguineo if patient else '')|e }}">
         </label>
     </fieldset>
 
@@ -97,39 +120,53 @@
         <legend>Pré-natal</legend>
         <label>
             <span>Médico obstetra</span>
-            <input type="text" name="medico_obstetra" value="{{ (patient.medico_obstetra if patient else 'Dra. Leiza')|e }}">
+            <input type="text" name="medico_obstetra"
+                   value="{{ (patient.medico_obstetra if patient else 'Dra. Leiza')|e }}">
         </label>
         <label>
-            <span>Hospital de referência <em class="hint">(usado pelo bot quando precisar encaminhar)</em></span>
-            <input type="text" name="hospital_referencia" value="{{ (patient.hospital_referencia if patient else '')|e }}">
+            <span>Hospital de referência</span>
+            <input type="text" name="hospital_referencia"
+                   value="{{ (patient.hospital_referencia if patient else '')|e }}">
+            <p class="hint">Usado pelo bot quando precisar encaminhar.</p>
         </label>
         <label>
             <span>Plano de saúde</span>
-            <input type="text" name="plano_saude" value="{{ (patient.plano_saude if patient else '')|e }}">
+            <input type="text" name="plano_saude"
+                   value="{{ (patient.plano_saude if patient else '')|e }}">
         </label>
     </fieldset>
 
     <fieldset>
         <legend>Contato de emergência</legend>
-        <p class="hint" style="margin-top: 0">Pessoa que deve ser acionada em urgências envolvendo a paciente — geralmente marido, mãe, irmã ou outro responsável próximo. O bot menciona esse contato quando relevante (ex: "se quiser, posso te ajudar a avisar o Daniel?").</p>
+        <p class="fieldset-intro">
+            Pessoa que deve ser acionada em urgências envolvendo a paciente — geralmente marido,
+            mãe, irmã ou outro responsável próximo. O bot menciona esse contato quando relevante
+            (ex: <em>"se quiser, posso te ajudar a avisar o Daniel?"</em>).
+        </p>
         <div class="row">
             <label>
                 <span>Nome</span>
-                <input type="text" name="contato_emergencia_nome" placeholder="Daniel" value="{{ (patient.contato_emergencia_nome if patient else '')|e }}">
+                <input type="text" name="contato_emergencia_nome" placeholder="Daniel"
+                       value="{{ (patient.contato_emergencia_nome if patient else '')|e }}">
             </label>
             <label>
                 <span>Relação</span>
-                <input type="text" name="contato_emergencia_relacao" placeholder="marido, mãe, irmã…" value="{{ (patient.contato_emergencia_relacao if patient else '')|e }}">
+                <input type="text" name="contato_emergencia_relacao" placeholder="marido, mãe, irmã…"
+                       value="{{ (patient.contato_emergencia_relacao if patient else '')|e }}">
             </label>
         </div>
         <label>
-            <span>Telefone <em class="hint">(E.164 sem +)</em></span>
-            <input type="tel" name="contato_emergencia_telefone" pattern="\d{10,15}" placeholder="5511988887777" value="{{ (patient.contato_emergencia_telefone if patient else '')|e }}">
+            <span>Telefone</span>
+            <input type="tel" name="contato_emergencia_telefone" pattern="\d{10,15}"
+                   inputmode="numeric" placeholder="5511988887777"
+                   value="{{ (patient.contato_emergencia_telefone if patient else '')|e }}">
+            <p class="hint">E.164 sem o sinal de +.</p>
         </label>
     </fieldset>
 
     <fieldset>
-        <legend>Observações em texto livre <em class="hint" style="font-weight: normal">(o bot lê tudo isso pra contextualizar)</em></legend>
+        <legend>Observações em texto livre</legend>
+        <p class="fieldset-intro">O bot lê tudo isso pra contextualizar o atendimento.</p>
         <label>
             <span>Histórico clínico relevante</span>
             <textarea name="historico_clinico" rows="3">{{ (patient.historico_clinico if patient else '')|e }}</textarea>
@@ -140,17 +177,21 @@
         </label>
         <label>
             <span>Observações pessoais da Dra.</span>
-            <textarea name="observacoes_dra" rows="4" placeholder="Ex: paciente ansiosa, primeira gestação após 3 abortos, gosta de explicação detalhada, companheiro Daniel presente">{{ (patient.observacoes_dra if patient else '')|e }}</textarea>
+            <textarea name="observacoes_dra" rows="4"
+                      placeholder="Ex: paciente ansiosa, primeira gestação após 3 abortos, gosta de explicação detalhada, companheiro Daniel presente">{{ (patient.observacoes_dra if patient else '')|e }}</textarea>
         </label>
         <label>
-            <span>Preferências de atendimento <em class="hint">(curto — uma frase)</em></span>
-            <textarea name="preferencias_atendimento" rows="2" placeholder="Ex: prefere áudio a texto">{{ (patient.preferencias_atendimento if patient else '')|e }}</textarea>
+            <span>Preferências de atendimento</span>
+            <textarea name="preferencias_atendimento" rows="2"
+                      placeholder="Ex: prefere áudio a texto">{{ (patient.preferencias_atendimento if patient else '')|e }}</textarea>
+            <p class="hint">Curto — uma frase.</p>
         </label>
     </fieldset>
 
     <div class="actions">
-        <button type="submit" class="primary">Salvar</button>
-        <a href="/admin/">Cancelar</a>
+        <a href="/admin/" class="btn ghost">Cancelar</a>
+        <button type="submit" class="primary">Salvar paciente</button>
     </div>
 </form>
+
 {% endblock %}

@@ -1,39 +1,56 @@
 {% extends "admin/base.html" %}
 {% block title %}Pacientes — Obstetra{% endblock %}
 {% block content %}
-<h1>Pacientes</h1>
+
 {% if request.query_params.get("ok") %}
-<div class="alert ok">Paciente <strong>{{ request.query_params.get("ok") }}</strong> salva com sucesso.</div>
+<div class="alert ok" role="status">
+    Paciente <strong>{{ request.query_params.get("ok") }}</strong> salva com sucesso.
+</div>
 {% endif %}
 
+<div class="list-toolbar">
+    <h1 style="margin: 0;">Pacientes</h1>
+    {% if patients %}
+    <span class="list-count" aria-live="polite">
+        {{ patients|length }} cadastrada{{ 's' if patients|length != 1 else '' }}
+    </span>
+    {% endif %}
+</div>
+
 {% if patients %}
-<table>
-    <thead>
-        <tr>
-            <th>Nome</th>
-            <th>Telefone</th>
-            <th>Semanas</th>
-            <th>Tipo</th>
-            <th>Risco</th>
-            <th></th>
-        </tr>
-    </thead>
-    <tbody>
+<ul class="patient-list" role="list">
     {% for p in patients %}
-        <tr>
-            <td><strong>{{ p.nome }}</strong></td>
-            <td>{{ p.phone }}</td>
-            <td>{{ p.semanas if p.semanas is not none else "—" }}</td>
-            <td>{{ p.tipo }}</td>
-            <td>
+    <li>
+        <a class="patient-card" href="/admin/{{ p.phone }}" aria-label="Editar paciente {{ p.nome }}">
+            <span class="patient-avatar" aria-hidden="true">
+                {{ (p.nome[:1] ~ (p.nome.split(' ')[-1][:1] if ' ' in p.nome else ''))|upper }}
+            </span>
+            <span class="patient-body">
+                <span class="patient-name">{{ p.nome }}</span>
+                <span class="patient-meta">
+                    <span>{{ p.phone }}</span>
+                    <span class="dot" aria-hidden="true"></span>
+                    <span>
+                        {% if p.semanas is not none %}{{ p.semanas }} sem.{% else %}sem DUM{% endif %}
+                    </span>
+                    <span class="dot" aria-hidden="true"></span>
+                    <span>{{ p.tipo }}</span>
+                </span>
+            </span>
+            <span class="patient-trail">
                 <span class="badge badge-{{ p.risco }}">{{ p.risco }}</span>
-            </td>
-            <td><a href="/admin/{{ p.phone }}">Editar →</a></td>
-        </tr>
+                <span class="patient-chevron" aria-hidden="true">›</span>
+            </span>
+        </a>
+    </li>
     {% endfor %}
-    </tbody>
-</table>
+</ul>
 {% else %}
-<p>Nenhuma paciente cadastrada ainda. <a href="/admin/novo">Cadastrar a primeira →</a></p>
+<div class="empty-state">
+    <h3>Nenhuma paciente cadastrada</h3>
+    <p>Comece cadastrando a primeira paciente do consultório.</p>
+    <a href="/admin/novo" class="btn primary">+ Cadastrar primeira paciente</a>
+</div>
 {% endif %}
+
 {% endblock %}
