@@ -1,0 +1,70 @@
+{% extends "admin/base.html" %}
+{% block title %}Agenda — semana — Obstetra{% endblock %}
+{% block content %}
+
+<div class="agenda-toolbar">
+    <h1 style="margin:0;">Agenda</h1>
+    <span class="list-count">{{ total }} {{ 'consulta' if total == 1 else 'consultas' }} na semana</span>
+</div>
+
+<div class="agenda-vista">
+    <a href="/admin/agenda" class="agenda-vista-btn">Dia</a>
+    <a href="/admin/agenda?vista=semana" class="agenda-vista-btn active" aria-current="page">Semana</a>
+</div>
+
+<div class="agenda-nav">
+    <a href="/admin/agenda?vista=semana&inicio={{ prev_week }}" class="agenda-nav-btn" aria-label="Semana anterior">‹</a>
+    <div class="agenda-nav-center">
+        <strong>{{ week_start.strftime('%d/%m') }} – {{ week_end.strftime('%d/%m/%Y') }}</strong>
+        <span class="agenda-weekday">semana</span>
+    </div>
+    <a href="/admin/agenda?vista=semana&inicio={{ next_week }}" class="agenda-nav-btn" aria-label="Próxima semana">›</a>
+</div>
+
+<div class="agenda-actions">
+    <a href="/admin/agenda/nova" class="btn primary">+ Nova consulta</a>
+    <a href="/admin/agenda?vista=semana" class="btn ghost">Voltar pra semana atual</a>
+</div>
+
+<div class="semana-grid">
+    {% for d in days %}
+    <section class="dia-bloco {% if d.is_today %}dia-bloco-hoje{% endif %} {% if d.count == 0 %}dia-bloco-vazio{% endif %}">
+        <header class="dia-header">
+            <a href="/admin/agenda?data={{ d.date_iso }}" class="dia-link">
+                <span class="dia-data">
+                    <strong>{{ d.weekday }}</strong>
+                    <span>{{ d.date.strftime('%d/%m') }}</span>
+                    {% if d.is_today %}<span class="dia-hoje-tag">hoje</span>{% endif %}
+                </span>
+                <span class="dia-count">{{ d.count }}</span>
+            </a>
+            <a href="/admin/agenda/nova?data={{ d.date_iso }}" class="dia-add" aria-label="+ Nova nesse dia">+</a>
+        </header>
+
+        {% if d.consultas %}
+        <ul class="agenda-list" role="list">
+            {% for it in d.consultas %}
+            <li class="agenda-item agenda-{{ it.status }}">
+                <span class="agenda-time">
+                    {{ it.hora }}
+                    <small class="agenda-duracao">{{ it.duracao_min }}min</small>
+                </span>
+                <span class="agenda-body">
+                    <a href="/admin/{{ it.patient_phone }}" class="agenda-patient">{{ it.patient_name }}</a>
+                    <span class="agenda-text">
+                        <strong>{{ it.tipo }}</strong>{% if it.obs %} · {{ it.obs }}{% endif %}
+                    </span>
+                </span>
+                <span class="agenda-status agenda-status-{{ it.status }}">{{ it.status }}</span>
+                <a href="/admin/agenda/{{ it.id }}/editar" class="agenda-edit" aria-label="Editar">✎</a>
+            </li>
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="dia-vazio">Sem consultas</p>
+        {% endif %}
+    </section>
+    {% endfor %}
+</div>
+
+{% endblock %}

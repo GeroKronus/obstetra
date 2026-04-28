@@ -337,13 +337,24 @@ def _parse_target_date(data: str) -> date:
     return datetime.now(brt).date()
 
 
+def _monday_of_week(d: date) -> date:
+    """Retorna a segunda-feira da semana que contem 'd'."""
+    from datetime import timedelta
+    return d - timedelta(days=d.weekday())
+
+
 @router.get("/agenda", response_class=HTMLResponse)
 async def admin_agenda(
     request: Request,
     data: str = "",
+    vista: str = "dia",
+    inicio: str = "",
     _: str = Depends(verify_admin),
 ):
-    """Visao do dia da agenda de consultas."""
+    """Agenda de consultas. vista=dia (default) ou vista=semana."""
+    if vista == "semana":
+        return await _admin_agenda_semana(request, inicio)
+
     from datetime import timedelta
     from zoneinfo import ZoneInfo
     from sqlmodel import Session, select
@@ -391,6 +402,83 @@ async def admin_agenda(
             "prev_day": prev_day,
             "next_day": next_day,
             "today_iso": today.isoformat(),
+        },
+    )
+
+
+async def _admin_agenda_semana(request: Request, inicio: str) -> HTMLResponse:
+    """Visao semanal: 7 dias agrupados, da segunda ao domingo."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import Appointment, Patient
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    base_date = _parse_target_date(inicio)
+    week_start = _monday_of_week(base_date)
+    week_end = week_start + timedelta(days=6)
+
+    # Janela UTC cobrindo segunda 00:00 BRT a domingo 23:59 BRT
+    start_utc, _ = _day_window_utc(week_start)
+    _, end_utc = _day_window_utc(week_end)
+
+    # Inicializa estrutura por dia
+    days: list[dict] = []
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        days.append({
+            "date": d,
+            "date_iso": d.isoformat(),
+            "weekday": ['Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'][i],
+            "consultas": [],
+        })
+
+    with Session(engine) as db:
+        rows = db.exec(
+            select(Appointment, Patient)
+            .join(Patient, Appointment.patient_id == Patient.id)
+            .where(Appointment.scheduled_at >= start_utc)
+            .where(Appointment.scheduled_at <= end_utc)
+            .order_by(Appointment.scheduled_at)
+        ).all()
+        for ap, pat in rows:
+            when_brt = ap.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
+            idx = (when_brt.date() - week_start).days
+            if 0 <= idx < 7:
+                days[idx]["consultas"].append({
+                    "id": ap.id,
+                    "patient_phone": pat.phone,
+                    "patient_name": pat.name or pat.phone,
+                    "hora": when_brt.strftime("%H:%M"),
+                    "duracao_min": ap.duracao_min,
+                    "tipo": ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo),
+                    "obs": ap.obs or "",
+                    "status": ap.status.value if hasattr(ap.status, "value") else str(ap.status),
+                })
+
+    today = datetime.now(brt).date()
+    for d in days:
+        d["is_today"] = (d["date"] == today)
+        d["count"] = len(d["consultas"])
+
+    total = sum(d["count"] for d in days)
+
+    prev_week = (week_start - timedelta(days=7)).isoformat()
+    next_week = (week_start + timedelta(days=7)).isoformat()
+
+    return templates.TemplateResponse(
+        request,
+        "admin/agenda_semana.html",
+        {
+            "days": days,
+            "week_start": week_start,
+            "week_end": week_end,
+            "week_start_iso": week_start.isoformat(),
+            "prev_week": prev_week,
+            "next_week": next_week,
+            "today_iso": today.isoformat(),
+            "total": total,
         },
     )
 
