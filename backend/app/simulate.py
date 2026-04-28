@@ -178,6 +178,80 @@ async def simulate_doctor(req: SimulateDoctorRequest) -> SimulateDoctorResponse:
     )
 
 
+class CancelScheduledResponse(BaseModel):
+    cancelled_count: int
+    cancelled_ids: list[int]
+
+
+@router.post("/simulate/cancel-all-scheduled", response_model=CancelScheduledResponse)
+async def cancel_all_scheduled() -> CancelScheduledResponse:
+    """Cancela todos os ScheduledMessage que ainda nao foram enviados nem cancelados."""
+    from datetime import datetime as dt
+
+    with Session(engine) as db:
+        pending = db.exec(
+            select(ScheduledMessage)
+            .where(ScheduledMessage.sent_at.is_(None))
+            .where(ScheduledMessage.cancelled_at.is_(None))
+        ).all()
+
+        ids: list[int] = []
+        now = dt.utcnow()
+        for s in pending:
+            s.cancelled_at = now
+            db.add(s)
+            ids.append(s.id or 0)
+        db.commit()
+
+    log.info("cancelados %d lembretes pendentes: %s", len(ids), ids)
+    return CancelScheduledResponse(cancelled_count=len(ids), cancelled_ids=ids)
+
+
+@router.post("/simulate/cancel-scheduled/{sched_id}", response_model=CancelScheduledResponse)
+async def cancel_scheduled(sched_id: int) -> CancelScheduledResponse:
+    """Cancela um ScheduledMessage especifico por id."""
+    from datetime import datetime as dt
+
+    with Session(engine) as db:
+        s = db.exec(
+            select(ScheduledMessage).where(ScheduledMessage.id == sched_id)
+        ).first()
+        if not s:
+            return CancelScheduledResponse(cancelled_count=0, cancelled_ids=[])
+        if s.sent_at is not None:
+            log.info("cancel #%d ignorado — ja foi enviado", sched_id)
+            return CancelScheduledResponse(cancelled_count=0, cancelled_ids=[])
+        if s.cancelled_at is not None:
+            log.info("cancel #%d ignorado — ja estava cancelado", sched_id)
+            return CancelScheduledResponse(cancelled_count=0, cancelled_ids=[])
+        s.cancelled_at = dt.utcnow()
+        db.add(s)
+        db.commit()
+
+    log.info("cancelado lembrete #%d", sched_id)
+    return CancelScheduledResponse(cancelled_count=1, cancelled_ids=[sched_id])
+
+
+@router.get("/simulate/scheduled", response_model=list[dict])
+async def list_scheduled() -> list[dict]:
+    """Lista todos os agendamentos com status."""
+    with Session(engine) as db:
+        rows = db.exec(
+            select(ScheduledMessage).order_by(ScheduledMessage.scheduled_at)
+        ).all()
+        return [
+            {
+                "id": s.id,
+                "patient_id": s.patient_id,
+                "scheduled_at": s.scheduled_at.isoformat(timespec="minutes"),
+                "sent_at": s.sent_at.isoformat(timespec="minutes") if s.sent_at else None,
+                "cancelled_at": s.cancelled_at.isoformat(timespec="minutes") if s.cancelled_at else None,
+                "text": s.text[:100] + ("..." if len(s.text) > 100 else ""),
+            }
+            for s in rows
+        ]
+
+
 @router.delete("/simulate/{phone}", response_model=SimulateResetResponse)
 async def reset(phone: str) -> SimulateResetResponse:
     """Limpa o estado simulado de uma paciente no banco SQLite (nao mexe no vault)."""

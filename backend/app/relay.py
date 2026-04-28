@@ -120,13 +120,33 @@ RELAY_TOOLS: list[dict[str, Any]] = [
             "required": ["telefone", "momento_iso", "mensagem"],
         },
     },
+    {
+        "name": "cancelar_lembrete",
+        "description": (
+            "Cancela um lembrete que ainda NÃO foi enviado. "
+            "Use quando a doutora pedir 'cancela o lembrete pra X', 'desmarca aquele agendamento das 12h55', "
+            "'esquece aquele último', etc. "
+            "Pegue o `id` do lembrete na lista de <lembretes_pendentes> do contexto. "
+            "Se a doutora pedir múltiplos, chame essa tool várias vezes (uma por id)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "ID do lembrete a cancelar (vem da lista <lembretes_pendentes> do contexto).",
+                },
+            },
+            "required": ["id"],
+        },
+    },
 ]
 
 
 _DEFAULT_RELAY_PROMPT = """\
 Você é assistente da {doctor_name}. Neste contexto, você está recebendo mensagens DA PRÓPRIA {doctor_name}, não de pacientes.
 
-A {doctor_name} costuma usar este canal para 4 coisas:
+A {doctor_name} costuma usar este canal para 5 coisas:
 
 1. **Encaminhar uma resposta dela à paciente** que você escalou recentemente. Ex:
    - "Responda à Patricia que entrarei em contato segunda."
@@ -148,9 +168,19 @@ A {doctor_name} costuma usar este canal para 4 coisas:
    - Use `agendar_lembrete(telefone, momento_iso, mensagem)`.
    - Em seguida, use `responder_doutora` confirmando: "Agendado lembrete pra Patricia hoje às 11h."
 
-3. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
+3. **Cancelar um lembrete agendado.** Ex:
+   - "Cancela o lembrete pra Patricia das 12h55."
+   - "Esquece aquele último que agendei."
+   - "Desmarca todos os lembretes da Maria."
+   Quando isso acontecer:
+   - Olhe a lista `<lembretes_pendentes>` no contexto e identifique pelo `id`.
+   - Use `cancelar_lembrete(id)` — múltiplos = chamadas múltiplas.
+   - "O último que agendei" = id mais alto. "Aquele das 12h55" = match pelo horário. "Todos da Maria" = todos cujo paciente seja Maria.
+   - Em seguida, use `responder_doutora` confirmando o cancelamento.
 
-4. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
+4. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
+
+5. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
 
 **Princípios:**
 - A {doctor_name} é superior. Tom cordial-profissional, conciso. Pode chamar "doutora".
@@ -233,6 +263,34 @@ def _now_brt_block() -> str:
     )
 
 
+def _pending_scheduled_block(db: Session) -> str:
+    """Lista lembretes ainda nao enviados — pra agente referenciar quando doutora
+    pedir cancelamento ou modificacao."""
+    rows = db.exec(
+        select(ScheduledMessage, Patient)
+        .join(Patient, ScheduledMessage.patient_id == Patient.id)
+        .where(ScheduledMessage.sent_at.is_(None))
+        .where(ScheduledMessage.cancelled_at.is_(None))
+        .order_by(ScheduledMessage.scheduled_at)
+        .limit(20)
+    ).all()
+
+    if not rows:
+        return "<lembretes_pendentes>nenhum lembrete agendado no momento</lembretes_pendentes>"
+
+    lines = ["<lembretes_pendentes>"]
+    for s, pat in rows:
+        when_brt = s.scheduled_at.replace(tzinfo=timezone.utc).astimezone(_BRT)
+        when_str = when_brt.strftime("%d/%m %H:%M")
+        nome = pat.name or pat.phone
+        text_short = s.text[:80] + ("…" if len(s.text) > 80 else "")
+        lines.append(
+            f"  - id={s.id} | paciente: {nome} ({pat.phone}) | quando: {when_str} BRT | texto: \"{text_short}\""
+        )
+    lines.append("</lembretes_pendentes>")
+    return "\n".join(lines)
+
+
 class RelayAgent:
     def __init__(self) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
@@ -250,6 +308,7 @@ class RelayAgent:
             _now_brt_block(),
             _recent_escalations_block(db),
             _active_patients_block(),
+            _pending_scheduled_block(db),
         ]
         user_content = (
             "\n\n".join(context_parts)
@@ -415,6 +474,32 @@ class RelayAgent:
             human_when = momento.astimezone(_BRT).strftime("%d/%m/%Y às %H:%M")
             log.info("agendado lembrete id=%d para %s em %s", sched.id, telefone, human_when)
             return f"Lembrete agendado pra {patient.name or telefone} em {human_when} (id={sched.id})."
+
+        if name == "cancelar_lembrete":
+            sched_id = arguments.get("id")
+            if sched_id is None:
+                return "Erro: id é obrigatório."
+            try:
+                sched_id = int(sched_id)
+            except (ValueError, TypeError):
+                return f"Erro: id inválido ({sched_id})."
+
+            sched = db.exec(
+                select(ScheduledMessage).where(ScheduledMessage.id == sched_id)
+            ).first()
+            if not sched:
+                return f"Erro: lembrete id={sched_id} não existe."
+            if sched.sent_at is not None:
+                when = sched.sent_at.replace(tzinfo=timezone.utc).astimezone(_BRT).strftime("%d/%m %H:%M")
+                return f"Erro: lembrete id={sched_id} já foi enviado em {when}, não dá pra cancelar."
+            if sched.cancelled_at is not None:
+                return f"Lembrete id={sched_id} já estava cancelado."
+
+            sched.cancelled_at = utcnow()
+            db.add(sched)
+            db.commit()
+            log.info("cancelado lembrete id=%d via relay agent", sched_id)
+            return f"Lembrete id={sched_id} cancelado com sucesso."
 
         return f"Ferramenta desconhecida: {name}"
 
