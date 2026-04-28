@@ -313,65 +313,72 @@ async def admin_index(
     )
 
 
+def _day_window_utc(target_date: date) -> tuple[datetime, datetime]:
+    """Retorna (start_utc, end_utc) naive cobrindo BRT 00:00 a 23:59 do dia."""
+    from zoneinfo import ZoneInfo
+    brt = ZoneInfo("America/Sao_Paulo")
+    start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=brt)
+    end_brt = datetime.combine(target_date, datetime.max.time(), tzinfo=brt)
+    return (
+        start_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
+        end_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None),
+    )
+
+
+def _parse_target_date(data: str) -> date:
+    """Parseia ?data=YYYY-MM-DD; fallback pra hoje BRT."""
+    from zoneinfo import ZoneInfo
+    brt = ZoneInfo("America/Sao_Paulo")
+    if data:
+        try:
+            return date.fromisoformat(data.strip())
+        except ValueError:
+            pass
+    return datetime.now(brt).date()
+
+
 @router.get("/agenda", response_class=HTMLResponse)
 async def admin_agenda(
     request: Request,
     data: str = "",
     _: str = Depends(verify_admin),
 ):
-    """Mostra a agenda do dia (ou de uma data especifica via ?data=YYYY-MM-DD)."""
+    """Visao do dia da agenda de consultas."""
+    from datetime import timedelta
     from zoneinfo import ZoneInfo
-    from .models import ScheduledMessage, Patient
-
-    brt = ZoneInfo("America/Sao_Paulo")
-    target_date: date
-    if data:
-        try:
-            target_date = date.fromisoformat(data.strip())
-        except ValueError:
-            target_date = datetime.now(brt).date()
-    else:
-        target_date = datetime.now(brt).date()
-
-    # Janela do dia em UTC (BRT 00:00 a 23:59)
-    start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=brt)
-    end_brt = datetime.combine(target_date, datetime.max.time(), tzinfo=brt)
-    start_utc = start_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-    end_utc = end_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-
     from sqlmodel import Session, select
     from .db import engine
+    from .models import Appointment, Patient
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    target_date = _parse_target_date(data)
+    start_utc, end_utc = _day_window_utc(target_date)
+
     items: list[dict] = []
     with Session(engine) as db:
         rows = db.exec(
-            select(ScheduledMessage, Patient)
-            .join(Patient, ScheduledMessage.patient_id == Patient.id)
-            .where(ScheduledMessage.scheduled_at >= start_utc)
-            .where(ScheduledMessage.scheduled_at <= end_utc)
-            .order_by(ScheduledMessage.scheduled_at)
+            select(Appointment, Patient)
+            .join(Patient, Appointment.patient_id == Patient.id)
+            .where(Appointment.scheduled_at >= start_utc)
+            .where(Appointment.scheduled_at <= end_utc)
+            .order_by(Appointment.scheduled_at)
         ).all()
-        for s, pat in rows:
-            when_brt = s.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
-            if s.cancelled_at:
-                status = "cancelado"
-            elif s.sent_at:
-                status = "enviado"
-            else:
-                status = "pendente"
+        for ap, pat in rows:
+            when_brt = ap.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
             items.append({
-                "id": s.id,
+                "id": ap.id,
                 "patient_phone": pat.phone,
                 "patient_name": pat.name or pat.phone,
                 "hora": when_brt.strftime("%H:%M"),
-                "texto": s.text,
-                "status": status,
+                "duracao_min": ap.duracao_min,
+                "tipo": ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo),
+                "obs": ap.obs or "",
+                "status": ap.status.value if hasattr(ap.status, "value") else str(ap.status),
             })
 
-    # Datas pra navegação
-    from datetime import timedelta
+    today = datetime.now(brt).date()
     prev_day = (target_date - timedelta(days=1)).isoformat()
     next_day = (target_date + timedelta(days=1)).isoformat()
-    today = datetime.now(brt).date()
 
     return templates.TemplateResponse(
         request,
@@ -388,6 +395,310 @@ async def admin_agenda(
     )
 
 
+@router.get("/agenda/nova", response_class=HTMLResponse)
+async def admin_agenda_nova_form(
+    request: Request,
+    paciente: str = "",
+    data: str = "",
+    _: str = Depends(verify_admin),
+):
+    """Form de nova consulta. Aceita ?paciente=<phone>&data=YYYY-MM-DD pra pre-preencher."""
+    pacientes = _list_active_patients()
+    return templates.TemplateResponse(
+        request,
+        "admin/agenda_form.html",
+        {
+            "appointment": None,
+            "pacientes": pacientes,
+            "preset_phone": paciente or "",
+            "preset_date": data or "",
+            "error": None,
+        },
+    )
+
+
+@router.post("/agenda/nova")
+async def admin_agenda_nova_submit(
+    _: str = Depends(verify_admin),
+    paciente: str = Form(...),
+    data_consulta: str = Form(...),
+    hora_consulta: str = Form(...),
+    duracao_min: int = Form(30),
+    tipo: str = Form("consulta"),
+    obs: str = Form(""),
+):
+    from zoneinfo import ZoneInfo
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import Appointment, AppointmentType, Patient
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    cleaned_phone = _clean_phone(paciente)
+    if not cleaned_phone:
+        raise HTTPException(status_code=400, detail="Telefone da paciente inválido.")
+
+    try:
+        d = date.fromisoformat(data_consulta.strip())
+        h, m = [int(x) for x in hora_consulta.strip().split(":")[:2]]
+        when_brt = datetime(d.year, d.month, d.day, h, m, tzinfo=brt)
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="Data/hora inválida.")
+
+    when_utc = when_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    # Verifica se paciente existe no vault (ficha)
+    vault_anamnese = _vault_pacientes_path() / cleaned_phone / "anamnese.md"
+    if not vault_anamnese.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Paciente com telefone {cleaned_phone} não está cadastrada. Cadastre primeiro em /admin/novo.",
+        )
+
+    with Session(engine) as db:
+        patient = db.exec(select(Patient).where(Patient.phone == cleaned_phone)).first()
+        if not patient:
+            # Cria Patient no DB a partir da ficha do vault — secretaria
+            # pode cadastrar e ja agendar antes da paciente conversar
+            from .models import OnboardingState
+            try:
+                fm = frontmatter.load(vault_anamnese).metadata or {}
+            except Exception:
+                fm = {}
+            patient = Patient(
+                phone=cleaned_phone,
+                name=fm.get("nome") or None,
+                onboarding_state=OnboardingState.DONE,
+            )
+            db.add(patient)
+            db.commit()
+            db.refresh(patient)
+
+        try:
+            tipo_enum = AppointmentType(tipo)
+        except ValueError:
+            tipo_enum = AppointmentType.CONSULTA
+
+        ap = Appointment(
+            patient_id=patient.id or 0,
+            scheduled_at=when_utc,
+            duracao_min=max(5, int(duracao_min)),
+            tipo=tipo_enum,
+            obs=obs.strip() or None,
+            created_by="secretaria",
+        )
+        db.add(ap)
+        db.commit()
+        log.info("agenda nova consulta paciente=%s em %s", cleaned_phone, when_brt.isoformat(timespec="minutes"))
+
+    return RedirectResponse(url=f"/admin/agenda?data={d.isoformat()}", status_code=303)
+
+
+@router.get("/agenda/{appt_id}/editar", response_class=HTMLResponse)
+async def admin_agenda_editar_form(
+    appt_id: int,
+    request: Request,
+    _: str = Depends(verify_admin),
+):
+    from zoneinfo import ZoneInfo
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import Appointment, Patient
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    with Session(engine) as db:
+        row = db.exec(
+            select(Appointment, Patient)
+            .join(Patient, Appointment.patient_id == Patient.id)
+            .where(Appointment.id == appt_id)
+        ).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Consulta não encontrada")
+        ap, pat = row
+        when_brt = ap.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
+        appt_dict = {
+            "id": ap.id,
+            "patient_phone": pat.phone,
+            "patient_name": pat.name or pat.phone,
+            "data": when_brt.strftime("%Y-%m-%d"),
+            "hora": when_brt.strftime("%H:%M"),
+            "duracao_min": ap.duracao_min,
+            "tipo": ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo),
+            "obs": ap.obs or "",
+            "status": ap.status.value if hasattr(ap.status, "value") else str(ap.status),
+        }
+
+    return templates.TemplateResponse(
+        request,
+        "admin/agenda_form.html",
+        {
+            "appointment": appt_dict,
+            "pacientes": [],
+            "preset_phone": "",
+            "preset_date": "",
+            "error": None,
+        },
+    )
+
+
+@router.post("/agenda/{appt_id}")
+async def admin_agenda_editar_submit(
+    appt_id: int,
+    _: str = Depends(verify_admin),
+    data_consulta: str = Form(...),
+    hora_consulta: str = Form(...),
+    duracao_min: int = Form(30),
+    tipo: str = Form("consulta"),
+    obs: str = Form(""),
+    status_consulta: str = Form("agendada"),
+):
+    from zoneinfo import ZoneInfo
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import Appointment, AppointmentStatus, AppointmentType, utcnow
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    try:
+        d = date.fromisoformat(data_consulta.strip())
+        h, m = [int(x) for x in hora_consulta.strip().split(":")[:2]]
+        when_brt = datetime(d.year, d.month, d.day, h, m, tzinfo=brt)
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="Data/hora inválida.")
+    when_utc = when_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    with Session(engine) as db:
+        ap = db.exec(select(Appointment).where(Appointment.id == appt_id)).first()
+        if not ap:
+            raise HTTPException(status_code=404, detail="Consulta não encontrada")
+
+        try:
+            ap.tipo = AppointmentType(tipo)
+        except ValueError:
+            pass
+        try:
+            new_status = AppointmentStatus(status_consulta)
+        except ValueError:
+            new_status = ap.status
+        ap.status = new_status
+        ap.scheduled_at = when_utc
+        ap.duracao_min = max(5, int(duracao_min))
+        ap.obs = obs.strip() or None
+        ap.updated_at = utcnow()
+        if new_status == AppointmentStatus.CANCELADA and ap.cancelled_at is None:
+            ap.cancelled_at = utcnow()
+        db.add(ap)
+        db.commit()
+
+    return RedirectResponse(url=f"/admin/agenda?data={d.isoformat()}", status_code=303)
+
+
+@router.post("/agenda/{appt_id}/cancelar")
+async def admin_agenda_cancelar(
+    appt_id: int,
+    _: str = Depends(verify_admin),
+):
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import Appointment, AppointmentStatus, utcnow
+
+    with Session(engine) as db:
+        ap = db.exec(select(Appointment).where(Appointment.id == appt_id)).first()
+        if not ap:
+            raise HTTPException(status_code=404, detail="Consulta não encontrada")
+        ap.status = AppointmentStatus.CANCELADA
+        ap.cancelled_at = utcnow()
+        ap.updated_at = utcnow()
+        db.add(ap)
+        db.commit()
+        d_iso = ap.scheduled_at.date().isoformat()
+
+    return RedirectResponse(url=f"/admin/agenda?data={d_iso}", status_code=303)
+
+
+@router.get("/lembretes", response_class=HTMLResponse)
+async def admin_lembretes(
+    request: Request,
+    data: str = "",
+    _: str = Depends(verify_admin),
+):
+    """Lista lembretes (ScheduledMessage) por dia — diferente de consultas."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import ScheduledMessage, Patient
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    target_date = _parse_target_date(data)
+    start_utc, end_utc = _day_window_utc(target_date)
+
+    items: list[dict] = []
+    with Session(engine) as db:
+        rows = db.exec(
+            select(ScheduledMessage, Patient)
+            .join(Patient, ScheduledMessage.patient_id == Patient.id)
+            .where(ScheduledMessage.scheduled_at >= start_utc)
+            .where(ScheduledMessage.scheduled_at <= end_utc)
+            .order_by(ScheduledMessage.scheduled_at)
+        ).all()
+        for s, pat in rows:
+            when_brt = s.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
+            if s.cancelled_at:
+                st = "cancelado"
+            elif s.sent_at:
+                st = "enviado"
+            else:
+                st = "pendente"
+            items.append({
+                "id": s.id,
+                "patient_phone": pat.phone,
+                "patient_name": pat.name or pat.phone,
+                "hora": when_brt.strftime("%H:%M"),
+                "texto": s.text,
+                "status": st,
+            })
+
+    today = datetime.now(brt).date()
+    prev_day = (target_date - timedelta(days=1)).isoformat()
+    next_day = (target_date + timedelta(days=1)).isoformat()
+
+    return templates.TemplateResponse(
+        request,
+        "admin/lembretes.html",
+        {
+            "items": items,
+            "target_date": target_date,
+            "target_date_iso": target_date.isoformat(),
+            "is_today": target_date == today,
+            "prev_day": prev_day,
+            "next_day": next_day,
+            "today_iso": today.isoformat(),
+        },
+    )
+
+
+def _list_active_patients() -> list[dict]:
+    """Le vault e retorna pacientes ativas (nome + phone) pra select do form."""
+    pacientes_dir = _vault_pacientes_path()
+    out: list[dict] = []
+    if not pacientes_dir.exists():
+        return out
+    for d in sorted(pacientes_dir.iterdir()):
+        if not d.is_dir():
+            continue
+        anamnese = d / "anamnese.md"
+        if not anamnese.exists():
+            continue
+        try:
+            post = frontmatter.load(anamnese)
+            fm = post.metadata or {}
+        except Exception:
+            continue
+        if fm.get("status") and fm.get("status") != "ativa":
+            continue
+        out.append({"phone": d.name, "nome": fm.get("nome") or d.name})
+    return out
+
+
 @router.get("/novo", response_class=HTMLResponse)
 async def admin_novo_form(request: Request, _: str = Depends(verify_admin)):
     return templates.TemplateResponse(
@@ -399,13 +710,54 @@ async def admin_novo_form(request: Request, _: str = Depends(verify_admin)):
 
 @router.get("/{phone}", response_class=HTMLResponse)
 async def admin_edit_form(phone: str, request: Request, _: str = Depends(verify_admin)):
+    from zoneinfo import ZoneInfo
+    from sqlmodel import Session, select
+    from .db import engine
+    from .models import Appointment, Patient
+
     patient = _load_patient(phone)
     if not patient:
         raise HTTPException(status_code=404, detail="Paciente não encontrada")
+
+    # Carrega consultas (proximas + historico)
+    proximas: list[dict] = []
+    historico: list[dict] = []
+    brt = ZoneInfo("America/Sao_Paulo")
+    now_utc = datetime.utcnow()
+    with Session(engine) as db:
+        pat_row = db.exec(select(Patient).where(Patient.phone == phone)).first()
+        if pat_row:
+            rows = db.exec(
+                select(Appointment)
+                .where(Appointment.patient_id == pat_row.id)
+                .order_by(Appointment.scheduled_at.desc())
+            ).all()
+            for ap in rows:
+                when_brt = ap.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
+                item = {
+                    "id": ap.id,
+                    "quando": when_brt.strftime("%d/%m/%Y %H:%M"),
+                    "tipo": ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo),
+                    "obs": ap.obs or "",
+                    "status": ap.status.value if hasattr(ap.status, "value") else str(ap.status),
+                }
+                # Proximas: agendada/confirmada e no futuro
+                if ap.scheduled_at >= now_utc and ap.status.value in ("agendada", "confirmada"):
+                    proximas.append(item)
+                else:
+                    historico.append(item)
+            proximas.reverse()  # cronologica ascendente
+
     return templates.TemplateResponse(
         request,
         "admin/form.html",
-        {"patient": patient, "phone_lock": True, "error": None},
+        {
+            "patient": patient,
+            "phone_lock": True,
+            "error": None,
+            "consultas_proximas": proximas,
+            "consultas_historico": historico,
+        },
     )
 
 

@@ -78,3 +78,37 @@ class ScheduledMessage(SQLModel, table=True):
     error: Optional[str] = None
     created_by: str = "doctor_relay"  # quem criou (futuro: admin, system, etc.)
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class AppointmentStatus(str, Enum):
+    AGENDADA = "agendada"
+    CONFIRMADA = "confirmada"
+    REALIZADA = "realizada"
+    FALTA = "falta"
+    CANCELADA = "cancelada"
+    REMARCADA = "remarcada"
+
+
+class AppointmentType(str, Enum):
+    CONSULTA = "consulta"
+    RETORNO = "retorno"
+    EXAME = "exame"
+    OUTRO = "outro"
+
+
+class Appointment(SQLModel, table=True):
+    """Consulta agendada pra paciente. Criada pela secretaria (web) ou pela
+    propria Dra. (via relay agent no WhatsApp). Diferente de ScheduledMessage:
+    Appointment e' compromisso de atendimento; ScheduledMessage e' lembrete de texto.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    patient_id: int = Field(foreign_key="patient.id", index=True)
+    scheduled_at: datetime = Field(index=True)  # UTC naive
+    duracao_min: int = Field(default=30)
+    tipo: AppointmentType = Field(default=AppointmentType.CONSULTA)
+    obs: Optional[str] = None
+    status: AppointmentStatus = Field(default=AppointmentStatus.AGENDADA)
+    created_by: str = Field(default="secretaria")  # secretaria | doctor_relay | sistema
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    cancelled_at: Optional[datetime] = None

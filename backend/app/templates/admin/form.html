@@ -194,4 +194,47 @@
     </div>
 </form>
 
+{% if patient and phone_lock %}
+<section class="ficha-section">
+    <h2>
+        Próximas consultas
+        <a href="/admin/agenda/nova?paciente={{ patient.telefone }}" class="btn ghost" style="font-size:0.8rem;padding:0.3rem 0.7rem;min-height:auto;">+ Agendar</a>
+    </h2>
+    {% if consultas_proximas %}
+    <ul class="agenda-list" role="list">
+        {% for it in consultas_proximas %}
+        <li class="agenda-item agenda-{{ it.status }}">
+            <span class="agenda-time">{{ it.quando }}</span>
+            <span class="agenda-body">
+                <span class="agenda-text"><strong>{{ it.tipo }}</strong>{% if it.obs %} · {{ it.obs }}{% endif %}</span>
+            </span>
+            <span class="agenda-status agenda-status-{{ it.status }}">{{ it.status }}</span>
+            <a href="/admin/agenda/{{ it.id }}/editar" class="agenda-edit" aria-label="Editar">✎</a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">Nenhuma consulta marcada.</p>
+    {% endif %}
+</section>
+
+{% if consultas_historico %}
+<section class="ficha-section">
+    <h2>Histórico de consultas</h2>
+    <ul class="agenda-list" role="list">
+        {% for it in consultas_historico %}
+        <li class="agenda-item agenda-{{ it.status }}">
+            <span class="agenda-time">{{ it.quando }}</span>
+            <span class="agenda-body">
+                <span class="agenda-text"><strong>{{ it.tipo }}</strong>{% if it.obs %} · {{ it.obs }}{% endif %}</span>
+            </span>
+            <span class="agenda-status agenda-status-{{ it.status }}">{{ it.status }}</span>
+            <a href="/admin/agenda/{{ it.id }}/editar" class="agenda-edit" aria-label="Editar">✎</a>
+        </li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+{% endif %}
+
 {% endblock %}

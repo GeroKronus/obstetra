@@ -36,7 +36,7 @@ def _run_lightweight_migrations() -> None:
 
     migrations = [
         ("patient", "manual_handover_at", "TIMESTAMP NULL"),
-        ("message",  "source",             "TEXT NOT NULL DEFAULT 'bot'"),
+        ("message",  "source",             "TEXT NOT NULL DEFAULT 'BOT'"),
     ]
     with engine.connect() as conn:
         for table, column, decl in migrations:
@@ -56,6 +56,22 @@ def _run_lightweight_migrations() -> None:
             except Exception:
                 # Se a tabela ainda não existe (primeiro startup), create_all já lidou
                 pass
+
+        # Normaliza valores de enum em message.source — SQLAlchemy persiste pelo NOME
+        # (uppercase), mas a migration anterior setou DEFAULT 'bot' (lowercase). Idempotente.
+        try:
+            conn.exec_driver_sql(
+                "UPDATE message SET source = 'BOT' WHERE source = 'bot'"
+            )
+            conn.exec_driver_sql(
+                "UPDATE message SET source = 'PATIENT' WHERE source = 'patient'"
+            )
+            conn.exec_driver_sql(
+                "UPDATE message SET source = 'MANUAL' WHERE source = 'manual'"
+            )
+            conn.commit()
+        except Exception:
+            pass
 
 
 def get_session() -> Iterator[Session]:

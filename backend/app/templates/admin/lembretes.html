@@ -1,0 +1,54 @@
+{% extends "admin/base.html" %}
+{% block title %}Lembretes — Obstetra{% endblock %}
+{% block content %}
+
+<div class="agenda-toolbar">
+    <h1 style="margin:0;">Lembretes</h1>
+    <span class="list-count">
+        {{ items|length }} {{ 'lembrete' if items|length == 1 else 'lembretes' }}
+        {% if is_today %}hoje{% endif %}
+    </span>
+</div>
+
+<p class="hint" style="margin-top:-0.25rem;">
+    Mensagens automáticas que serão enviadas pra paciente. Diferente de <a href="/admin/agenda">consultas</a>.
+</p>
+
+<div class="agenda-nav">
+    <a href="/admin/lembretes?data={{ prev_day }}" class="agenda-nav-btn" aria-label="Dia anterior">‹</a>
+    <div class="agenda-nav-center">
+        <strong>{{ target_date.strftime('%d/%m/%Y') }}</strong>
+        <span class="agenda-weekday">
+            {%- set wd = target_date.weekday() -%}
+            {%- set names = ['Segunda','Terça','Quarta','Quinta','Sexta','Sábado','Domingo'] -%}
+            {{ names[wd] }}{% if is_today %} · hoje{% endif %}
+        </span>
+    </div>
+    <a href="/admin/lembretes?data={{ next_day }}" class="agenda-nav-btn" aria-label="Próximo dia">›</a>
+</div>
+
+{% if not is_today %}
+<p style="text-align:center;margin-top:0;"><a href="/admin/lembretes">Voltar pra hoje</a></p>
+{% endif %}
+
+{% if items %}
+<ul class="agenda-list" role="list">
+    {% for it in items %}
+    <li class="agenda-item agenda-{{ it.status }}">
+        <span class="agenda-time">{{ it.hora }}</span>
+        <span class="agenda-body">
+            <a href="/admin/{{ it.patient_phone }}" class="agenda-patient">{{ it.patient_name }}</a>
+            <span class="agenda-text">{{ it.texto }}</span>
+        </span>
+        <span class="agenda-status agenda-status-{{ it.status }}">{{ it.status }}</span>
+    </li>
+    {% endfor %}
+</ul>
+{% else %}
+<div class="empty-state">
+    <h3>Sem lembretes nesse dia</h3>
+    <p>Nenhum lembrete agendado pra {{ target_date.strftime('%d/%m/%Y') }}.</p>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -140,13 +140,36 @@ RELAY_TOOLS: list[dict[str, Any]] = [
             "required": ["id"],
         },
     },
+    {
+        "name": "feedback_interno",
+        "description": (
+            "Gera uma análise clínica interna pra Dra. Leiza sobre uma paciente específica e ENVIA "
+            "diretamente pra ela no WhatsApp. Use APENAS quando a doutora pedir explicitamente "
+            "'feedback interno', 'fb interno', 'feedback clínico', 'me dá um feedback', etc. "
+            "A análise é INTERNA, NUNCA vai pra paciente — vai só pro WhatsApp da doutora. "
+            "Identifique a paciente: se a doutora citar nome, use esse; senão pegue da última escalada nas "
+            "<escaladas_recentes>. Se não houver contexto suficiente (sem escalada recente e sem nome), "
+            "use `responder_doutora` pedindo o nome em vez de chamar essa ferramenta. "
+            "Após chamar essa tool com sucesso, NÃO precisa chamar `responder_doutora` — a tool já enviou."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "telefone": {
+                    "type": "string",
+                    "description": "Telefone da paciente em formato E.164 sem +, ex: 5528988030050. Tem que bater com a lista de escaladas recentes ou pacientes ativas.",
+                },
+            },
+            "required": ["telefone"],
+        },
+    },
 ]
 
 
 _DEFAULT_RELAY_PROMPT = """\
 Você é assistente da {doctor_name}. Neste contexto, você está recebendo mensagens DA PRÓPRIA {doctor_name}, não de pacientes.
 
-A {doctor_name} costuma usar este canal para 6 coisas:
+A {doctor_name} costuma usar este canal para 7 coisas:
 
 1. **Encaminhar uma resposta dela à paciente** que você escalou recentemente. Ex:
    - "Responda à Patricia que entrarei em contato segunda."
@@ -195,9 +218,19 @@ A {doctor_name} costuma usar este canal para 6 coisas:
    - Se o filtro retornar vazio, fale isso ("Nada agendado pra amanhã, doutora.")
    - Se a doutora citar nome ambíguo ou data inválida, peça clarificação.
 
-5. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
+5. **Feedback interno (apoio à decisão clínica).** Ex:
+   - "feedback interno" (logo após uma escalada — assume a paciente da escalada)
+   - "fb interno Maria" / "feedback clínico da Patricia" (paciente nomeada)
+   - "me dá um feedback sobre a Joana"
+   Quando isso acontecer:
+   - Identifique a paciente: nome citado > última escalada nas <escaladas_recentes>.
+   - Se não tiver contexto (sem escalada recente, sem nome), use `responder_doutora` perguntando: "Doutora, qual paciente?"
+   - Use `feedback_interno(telefone)` — a tool monta o histórico, roda o raciocínio clínico em modelo separado e ENVIA direto pra doutora.
+   - **REGRA RÍGIDA — após `feedback_interno` retornar com sucesso:** PARE. Não chame mais nenhuma ferramenta. Não chame `responder_doutora`. Não envie eco/confirmação. Encerre o turno em silêncio. A doutora já recebeu o feedback completo — uma confirmação adicional só polui o WhatsApp dela.
 
-6. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
+6. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
+
+7. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
 
 **Princípios:**
 - A {doctor_name} é superior. Tom cordial-profissional, conciso. Pode chamar "doutora".
@@ -306,6 +339,175 @@ def _pending_scheduled_block(db: Session) -> str:
         )
     lines.append("</lembretes_pendentes>")
     return "\n".join(lines)
+
+
+def _load_patient_anamnese(phone: str) -> tuple[str, str | None]:
+    """Le anamnese.md do vault da paciente. Retorna (texto_completo, nome_vault).
+    nome_vault e' o campo 'nome' do frontmatter, se existir."""
+    vault_path = Path(settings.vault_local_path) / "pacientes" / phone / "anamnese.md"
+    if not vault_path.exists():
+        return ("", None)
+    try:
+        post = frontmatter.load(vault_path)
+        fm = post.metadata or {}
+        body = (post.content or "").strip()
+        nome_vault = fm.get("nome") or None
+        fm_lines = []
+        for k, v in fm.items():
+            if v is None or v == "":
+                continue
+            fm_lines.append(f"{k}: {v}")
+        fm_text = "\n".join(fm_lines)
+        if fm_text and body:
+            return (f"{fm_text}\n\n---\n\n{body}", nome_vault)
+        return (fm_text or body, nome_vault)
+    except Exception:
+        log.exception("erro lendo anamnese de %s", phone)
+        return ("", None)
+
+
+def _load_recent_messages(db: Session, patient_id: int, limit: int = 50) -> list[Message]:
+    """Ultimas N mensagens da paciente (todos os direcionamentos), ordem cronologica."""
+    rows = db.exec(
+        select(Message)
+        .where(Message.patient_id == patient_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    ).all()
+    return list(reversed(rows))  # ordem cronologica pra leitura natural
+
+
+def _load_recent_escalation(db: Session, patient_id: int) -> Escalation | None:
+    """Pega a escalada mais recente da paciente (sem cutoff temporal — pode ser antiga)."""
+    return db.exec(
+        select(Escalation)
+        .where(Escalation.patient_id == patient_id)
+        .order_by(Escalation.created_at.desc())
+        .limit(1)
+    ).first()
+
+
+_CLINICAL_FEEDBACK_PROMPT = """\
+Você é um assistente clínico de apoio à decisão da {doctor_name}, médica obstetra/ginecologista.
+Recebeu o histórico de uma paciente e precisa devolver uma análise INTERNA pra doutora — \
+não pra paciente.
+
+**Estrutura da resposta** (use markdown leve, sem cabeçalho de saudação, em pt-BR):
+
+**Feedback interno — {patient_name}**
+
+**Hipóteses (em ordem de probabilidade):**
+- 1ª hipótese · breve justificativa baseada nos sintomas
+- 2ª · ...
+- 3ª se relevante
+
+**Diferenciais a considerar:**
+- alternativas razoáveis dado o quadro
+
+**Sinais de alarme a vigiar:**
+- bandeira vermelha 1
+- bandeira vermelha 2
+
+**O que perguntar / examinar pra refinar:**
+- 2-4 perguntas/exames específicos
+
+**Conduta sugerida (apoio, não prescrição):**
+- 1-3 condutas seguras dado o contexto da paciente (idade gestacional, comorbidades)
+- Mencione fármacos com restrições gestacionais quando aplicável
+
+_Hipóteses pra apoio, doutora — decisão clínica é sua._
+
+**Restrições:**
+- Se o histórico for insuficiente (poucas mensagens, sem queixa clara), diga isso e sugira o que falta saber.
+- Considere SEMPRE idade gestacional e comorbidades da anamnese se disponíveis.
+- Não invente dados que não estão no histórico.
+- Tom direto, profissional, sem floreios.
+- Sem disclaimer longo — só a frase final em itálico.
+- Máximo ~400 palavras.
+"""
+
+
+async def _run_clinical_feedback(
+    *,
+    patient: Patient,
+    db: Session,
+) -> str:
+    """Chama Opus 4.7 com o historico da paciente e devolve a analise como string."""
+    anamnese, nome_vault = _load_patient_anamnese(patient.phone)
+    messages = _load_recent_messages(db, patient.id or 0, limit=50)
+    last_escalation = _load_recent_escalation(db, patient.id or 0)
+
+    # Nome: prefere DB > vault > telefone
+    display_name = patient.name or nome_vault or patient.phone
+
+    # Monta contexto
+    parts: list[str] = []
+    parts.append(f"<paciente>\nNome: {display_name}\nTelefone: {patient.phone}")
+    if patient.gestational_weeks is not None:
+        parts.append(f"Semanas gestacionais (campo no DB): {patient.gestational_weeks}")
+    parts.append("</paciente>")
+
+    if anamnese:
+        parts.append(f"<anamnese_vault>\n{anamnese}\n</anamnese_vault>")
+    else:
+        parts.append("<anamnese_vault>(sem anamnese cadastrada no vault)</anamnese_vault>")
+
+    if last_escalation:
+        when = last_escalation.created_at.replace(tzinfo=timezone.utc).astimezone(_BRT)
+        parts.append(
+            f"<ultima_escalada>\n"
+            f"  data: {when.strftime('%d/%m/%Y %H:%M')} BRT\n"
+            f"  motivo: {last_escalation.reason}\n"
+            f"  resumo: {last_escalation.summary}\n"
+            f"</ultima_escalada>"
+        )
+    else:
+        parts.append("<ultima_escalada>(nenhuma escalada registrada)</ultima_escalada>")
+
+    if messages:
+        parts.append("<conversa_recente>")
+        for m in messages:
+            who = "PACIENTE" if m.direction == MessageDirection.INBOUND else "BOT/DRA"
+            when = m.created_at.replace(tzinfo=timezone.utc).astimezone(_BRT).strftime("%d/%m %H:%M")
+            text_short = (m.text or "").strip().replace("\n", " ")
+            if len(text_short) > 400:
+                text_short = text_short[:400] + "…"
+            parts.append(f"  [{when}] {who}: {text_short}")
+        parts.append("</conversa_recente>")
+    else:
+        parts.append("<conversa_recente>(sem mensagens registradas)</conversa_recente>")
+
+    user_content = "\n\n".join(parts)
+
+    system_prompt = _CLINICAL_FEEDBACK_PROMPT.format(
+        doctor_name=settings.doctor_name,
+        patient_name=display_name,
+    )
+
+    client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+    response = await client.messages.create(
+        model=settings.anthropic_model,  # Opus 4.7 — raciocinio clinico
+        max_tokens=2000,
+        thinking={"type": "adaptive"},
+        output_config={"effort": "high"},
+        system=[{"type": "text", "text": system_prompt}],
+        messages=[{"role": "user", "content": user_content}],
+    )
+
+    log.info(
+        "feedback_interno paciente=%s in=%d out=%d",
+        patient.phone,
+        response.usage.input_tokens,
+        response.usage.output_tokens,
+    )
+
+    text_blocks = [
+        b.text for b in response.content
+        if getattr(b, "type", None) == "text" and getattr(b, "text", "").strip()
+    ]
+    if not text_blocks:
+        return f"Feedback interno — {patient.name or patient.phone}\n\n(modelo não retornou análise — tente novamente)"
+    return "\n".join(text_blocks).strip()
 
 
 class RelayAgent:
@@ -517,6 +719,29 @@ class RelayAgent:
             db.commit()
             log.info("cancelado lembrete id=%d via relay agent", sched_id)
             return f"Lembrete id={sched_id} cancelado com sucesso."
+
+        if name == "feedback_interno":
+            telefone = str(arguments.get("telefone", "")).strip()
+            if not telefone:
+                return "Erro: telefone é obrigatório."
+            if not settings.doctor_phone_number:
+                return "Erro: DOCTOR_PHONE_NUMBER não configurado."
+
+            patient = db.exec(select(Patient).where(Patient.phone == telefone)).first()
+            if not patient:
+                return f"Erro: paciente com telefone {telefone} não está cadastrada."
+
+            try:
+                feedback_text = await _run_clinical_feedback(patient=patient, db=db)
+            except Exception as exc:
+                log.exception("falha gerando feedback interno pra %s", telefone)
+                return f"Erro ao gerar feedback: {exc}"
+
+            await provider.send_text(settings.doctor_phone_number, feedback_text)
+            return (
+                f"Feedback enviado à doutora sobre {patient.name or telefone}. "
+                f"PARE AQUI — não chame mais nenhuma ferramenta neste turno."
+            )
 
         return f"Ferramenta desconhecida: {name}"
 

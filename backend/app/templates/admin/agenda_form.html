@@ -1,0 +1,106 @@
+{% extends "admin/base.html" %}
+{% block title %}{{ "Editar consulta" if appointment else "Nova consulta" }} — Obstetra{% endblock %}
+{% block content %}
+
+<h1>{{ "Editar consulta" if appointment else "Nova consulta" }}</h1>
+
+{% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+
+<form method="POST" autocomplete="off" novalidate
+      action="{{ '/admin/agenda/' ~ appointment.id if appointment else '/admin/agenda/nova' }}">
+
+    <fieldset>
+        <legend>Paciente</legend>
+        {% if appointment %}
+        <label>
+            <span>Paciente</span>
+            <input type="text" value="{{ appointment.patient_name }} ({{ appointment.patient_phone }})" readonly>
+            <p class="hint">Pra agendar pra outra paciente, crie uma nova consulta.</p>
+        </label>
+        {% else %}
+        <label>
+            <span>Paciente *</span>
+            <select name="paciente" required>
+                <option value="">— escolha —</option>
+                {% for p in pacientes %}
+                <option value="{{ p.phone }}" {% if preset_phone == p.phone %}selected{% endif %}>
+                    {{ p.nome }} ({{ p.phone }})
+                </option>
+                {% endfor %}
+            </select>
+            <p class="hint">Só pacientes já cadastradas. Pra adicionar uma nova, vá em <a href="/admin/novo">+ Nova paciente</a>.</p>
+        </label>
+        {% endif %}
+    </fieldset>
+
+    <fieldset>
+        <legend>Quando</legend>
+        <div class="row">
+            <label>
+                <span>Data *</span>
+                <input type="date" name="data_consulta" required
+                       value="{{ appointment.data if appointment else preset_date }}">
+            </label>
+            <label>
+                <span>Hora *</span>
+                <input type="time" name="hora_consulta" required
+                       value="{{ appointment.hora if appointment else '09:00' }}">
+            </label>
+            <label>
+                <span>Duração (min)</span>
+                <input type="number" name="duracao_min" min="5" step="5"
+                       value="{{ appointment.duracao_min if appointment else 30 }}">
+            </label>
+        </div>
+    </fieldset>
+
+    <fieldset>
+        <legend>Detalhes</legend>
+        <label>
+            <span>Tipo</span>
+            <select name="tipo">
+                {% set t = appointment.tipo if appointment else 'consulta' %}
+                <option value="consulta" {% if t == 'consulta' %}selected{% endif %}>Consulta</option>
+                <option value="retorno" {% if t == 'retorno' %}selected{% endif %}>Retorno</option>
+                <option value="exame" {% if t == 'exame' %}selected{% endif %}>Exame</option>
+                <option value="outro" {% if t == 'outro' %}selected{% endif %}>Outro</option>
+            </select>
+        </label>
+        <label>
+            <span>Observação</span>
+            <textarea name="obs" rows="3" placeholder="Ex: trazer USG, jejum 8h, etc.">{{ appointment.obs if appointment else '' }}</textarea>
+        </label>
+
+        {% if appointment %}
+        <label>
+            <span>Status</span>
+            <select name="status_consulta">
+                {% set st = appointment.status %}
+                <option value="agendada"   {% if st == 'agendada' %}selected{% endif %}>Agendada</option>
+                <option value="confirmada" {% if st == 'confirmada' %}selected{% endif %}>Confirmada</option>
+                <option value="realizada"  {% if st == 'realizada' %}selected{% endif %}>Realizada</option>
+                <option value="falta"      {% if st == 'falta' %}selected{% endif %}>Falta</option>
+                <option value="cancelada"  {% if st == 'cancelada' %}selected{% endif %}>Cancelada</option>
+                <option value="remarcada"  {% if st == 'remarcada' %}selected{% endif %}>Remarcada</option>
+            </select>
+        </label>
+        {% endif %}
+    </fieldset>
+
+    <div class="form-actions">
+        <button type="submit" class="btn primary">
+            {{ "Salvar alterações" if appointment else "Agendar" }}
+        </button>
+        <a href="/admin/agenda" class="btn ghost">Voltar</a>
+    </div>
+</form>
+
+{% if appointment and appointment.status not in ('cancelada','realizada') %}
+<form method="POST" action="/admin/agenda/{{ appointment.id }}/cancelar" style="margin-top:1rem;">
+    <button type="submit" class="btn danger" onclick="return confirm('Cancelar essa consulta?');">
+        Cancelar consulta
+    </button>
+</form>
+{% endif %}
+
+{% endblock %}
