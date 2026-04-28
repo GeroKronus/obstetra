@@ -313,6 +313,81 @@ async def admin_index(
     )
 
 
+@router.get("/agenda", response_class=HTMLResponse)
+async def admin_agenda(
+    request: Request,
+    data: str = "",
+    _: str = Depends(verify_admin),
+):
+    """Mostra a agenda do dia (ou de uma data especifica via ?data=YYYY-MM-DD)."""
+    from zoneinfo import ZoneInfo
+    from .models import ScheduledMessage, Patient
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    target_date: date
+    if data:
+        try:
+            target_date = date.fromisoformat(data.strip())
+        except ValueError:
+            target_date = datetime.now(brt).date()
+    else:
+        target_date = datetime.now(brt).date()
+
+    # Janela do dia em UTC (BRT 00:00 a 23:59)
+    start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=brt)
+    end_brt = datetime.combine(target_date, datetime.max.time(), tzinfo=brt)
+    start_utc = start_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    end_utc = end_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    from sqlmodel import Session
+    from .db import engine
+    items: list[dict] = []
+    with Session(engine) as db:
+        rows = db.exec(
+            select(ScheduledMessage, Patient)
+            .join(Patient, ScheduledMessage.patient_id == Patient.id)
+            .where(ScheduledMessage.scheduled_at >= start_utc)
+            .where(ScheduledMessage.scheduled_at <= end_utc)
+            .order_by(ScheduledMessage.scheduled_at)
+        ).all()
+        for s, pat in rows:
+            when_brt = s.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
+            if s.cancelled_at:
+                status = "cancelado"
+            elif s.sent_at:
+                status = "enviado"
+            else:
+                status = "pendente"
+            items.append({
+                "id": s.id,
+                "patient_phone": pat.phone,
+                "patient_name": pat.name or pat.phone,
+                "hora": when_brt.strftime("%H:%M"),
+                "texto": s.text,
+                "status": status,
+            })
+
+    # Datas pra navegação
+    from datetime import timedelta
+    prev_day = (target_date - timedelta(days=1)).isoformat()
+    next_day = (target_date + timedelta(days=1)).isoformat()
+    today = datetime.now(brt).date()
+
+    return templates.TemplateResponse(
+        request,
+        "admin/agenda.html",
+        {
+            "items": items,
+            "target_date": target_date,
+            "target_date_iso": target_date.isoformat(),
+            "is_today": target_date == today,
+            "prev_day": prev_day,
+            "next_day": next_day,
+            "today_iso": today.isoformat(),
+        },
+    )
+
+
 @router.get("/novo", response_class=HTMLResponse)
 async def admin_novo_form(request: Request, _: str = Depends(verify_admin)):
     return templates.TemplateResponse(

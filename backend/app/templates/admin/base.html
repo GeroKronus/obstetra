@@ -143,6 +143,124 @@
             color: #fff;
         }
 
+        /* ----- AGENDA ----- */
+        .agenda-toolbar {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+        }
+        .agenda-nav {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-sm);
+            padding: 0.4rem;
+            margin: 0 0 1rem;
+        }
+        .agenda-nav-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 2.5rem;
+            height: 2.5rem;
+            border-radius: 8px;
+            color: var(--primary);
+            text-decoration: none;
+            font-size: 1.5rem;
+            font-weight: 600;
+            transition: background 0.15s;
+        }
+        .agenda-nav-btn:hover { background: var(--bg-soft); }
+        .agenda-nav-center {
+            text-align: center;
+            display: flex;
+            flex-direction: column;
+            gap: 0.1rem;
+        }
+        .agenda-weekday {
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+
+        .agenda-list {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            margin: 0;
+            padding: 0;
+            list-style: none;
+        }
+        .agenda-item {
+            display: grid;
+            grid-template-columns: 4.5rem 1fr auto;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 0.9rem;
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow-sm);
+            border-left: 3px solid var(--border);
+        }
+        .agenda-item.agenda-pendente { border-left-color: var(--primary); }
+        .agenda-item.agenda-enviado { border-left-color: #10b981; opacity: 0.75; }
+        .agenda-item.agenda-cancelado {
+            border-left-color: #9ca3af;
+            opacity: 0.55;
+        }
+        .agenda-time {
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+            font-size: 1.05rem;
+            color: var(--text);
+        }
+        .agenda-body {
+            display: flex;
+            flex-direction: column;
+            gap: 0.2rem;
+            min-width: 0;
+        }
+        .agenda-patient {
+            font-weight: 600;
+            color: var(--primary);
+            text-decoration: none;
+            font-size: 0.92rem;
+        }
+        .agenda-patient:hover { text-decoration: underline; }
+        .agenda-text {
+            color: var(--muted);
+            font-size: 0.85rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .agenda-status {
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            padding: 0.15rem 0.55rem;
+            border-radius: 10px;
+            white-space: nowrap;
+        }
+        .agenda-status-pendente { background: var(--primary-soft); color: var(--primary); }
+        .agenda-status-enviado  { background: #d1fae5; color: #065f46; }
+        .agenda-status-cancelado { background: #f3f4f6; color: #6b7280; }
+
+        @media (max-width: 480px) {
+            .agenda-item {
+                grid-template-columns: 3.5rem 1fr;
+                grid-template-rows: auto auto;
+            }
+            .agenda-status {
+                grid-column: 1 / -1;
+                justify-self: start;
+            }
+        }
+
         /* Navegação inferior (mobile) */
         .tabbar {
             position: fixed;
@@ -682,6 +800,7 @@
             </a>
             <nav class="nav-desktop" aria-label="Navegação principal">
                 <a href="/admin/">Pacientes</a>
+                <a href="/admin/agenda">Agenda</a>
                 <a href="/admin/novo" class="cta">+ Nova paciente</a>
             </nav>
         </div>
@@ -695,6 +814,10 @@
         <a href="/admin/" {% if request.url.path == '/admin/' or request.url.path == '/admin' %}class="active" aria-current="page"{% endif %}>
             <span class="ic" aria-hidden="true">☰</span>
             <span>Pacientes</span>
+        </a>
+        <a href="/admin/agenda" {% if request.url.path.startswith('/admin/agenda') %}class="active" aria-current="page"{% endif %}>
+            <span class="ic" aria-hidden="true">📅</span>
+            <span>Agenda</span>
         </a>
         <a href="/admin/novo" {% if request.url.path == '/admin/novo' %}class="active" aria-current="page"{% endif %}>
             <span class="ic" aria-hidden="true">＋</span>
