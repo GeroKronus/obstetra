@@ -3,16 +3,19 @@ ao WhatsApp. Usado pra testar a integracao com o vault sem precisar parear
 um numero real."""
 
 import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter
 from pydantic import BaseModel
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from .agent import get_agent
 from .config import settings
 from .db import engine
-from .models import Message, MessageDirection
+from .models import Message, MessageDirection, ScheduledMessage
 from .providers.buffered import BufferedProvider
+from .relay import get_relay_agent
 from .webhook import _get_or_create_patient
 
 log = logging.getLogger("obstetra.simulate")
@@ -107,6 +110,72 @@ async def simulate(req: SimulateRequest) -> SimulateResponse:
 class SimulateResetResponse(BaseModel):
     deleted_patient: bool
     deleted_messages: int
+
+
+class SimulateDoctorRequest(BaseModel):
+    text: str
+
+
+class ScheduledLite(BaseModel):
+    id: int
+    patient_phone: str
+    scheduled_at_utc: str
+    scheduled_at_brt: str
+    text: str
+
+
+class SimulateDoctorResponse(BaseModel):
+    messages_to_doctor: list[str]
+    messages_to_patients: list[dict]
+    scheduled_now: list[ScheduledLite]
+
+
+@router.post("/simulate/doctor", response_model=SimulateDoctorResponse)
+async def simulate_doctor(req: SimulateDoctorRequest) -> SimulateDoctorResponse:
+    """Simula uma mensagem da doutora pro relay agent (sem usar Evolution API real).
+    Retorna o que o agente teria respondido e quais ScheduledMessages foram criadas."""
+    log.info("simulate_doctor inbound text=%r", req.text[:120])
+    from .models import Patient
+
+    with Session(engine) as db:
+        cutoff = datetime.utcnow()
+        provider = BufferedProvider()
+        agent = get_relay_agent()
+        await agent.handle_doctor_message(text=req.text, provider=provider, db=db)
+
+        # Captura mensagens enviadas
+        doctor_phone = settings.doctor_phone_number or ""
+        to_doctor = [t for (p, t) in provider.sent if doctor_phone and p == doctor_phone]
+        to_patients = [
+            {"phone": p, "text": t}
+            for (p, t) in provider.sent
+            if not doctor_phone or p != doctor_phone
+        ]
+
+        # Captura agendamentos criados durante esse turno
+        new_scheds = db.exec(
+            select(ScheduledMessage)
+            .where(ScheduledMessage.created_at >= cutoff)
+            .order_by(ScheduledMessage.created_at)
+        ).all()
+
+        scheduled_lite: list[ScheduledLite] = []
+        brt = ZoneInfo("America/Sao_Paulo")
+        for s in new_scheds:
+            patient = db.exec(select(Patient).where(Patient.id == s.patient_id)).first()
+            scheduled_lite.append(ScheduledLite(
+                id=s.id or 0,
+                patient_phone=patient.phone if patient else "?",
+                scheduled_at_utc=s.scheduled_at.isoformat(timespec="minutes"),
+                scheduled_at_brt=s.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt).strftime("%d/%m/%Y %H:%M %Z"),
+                text=s.text,
+            ))
+
+    return SimulateDoctorResponse(
+        messages_to_doctor=to_doctor,
+        messages_to_patients=to_patients,
+        scheduled_now=scheduled_lite,
+    )
 
 
 @router.delete("/simulate/{phone}", response_model=SimulateResetResponse)

@@ -6,7 +6,9 @@ from sqlmodel import Field, SQLModel
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """Retorna UTC naive (sem tzinfo) — alinhado com o que SQLite armazena
+    e evita TypeError 'offset-naive vs offset-aware' em comparações."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class OnboardingState(str, Enum):
