@@ -236,7 +236,7 @@ def _now_brt_block() -> str:
 class RelayAgent:
     def __init__(self) -> None:
         self._client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
-        self._model = settings.anthropic_model
+        self._model = settings.anthropic_relay_model
 
     async def handle_doctor_message(
         self,

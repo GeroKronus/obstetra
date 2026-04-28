@@ -6,6 +6,9 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str
     anthropic_model: str = "claude-opus-4-7"
+    # Relay agent (interpretacao de comandos da doutora) usa modelo mais leve —
+    # nao tem raciocinio clinico, so NLU + composicao + roteamento de ferramentas.
+    anthropic_relay_model: str = "claude-sonnet-4-6"
 
     evolution_api_url: str
     evolution_api_key: str
