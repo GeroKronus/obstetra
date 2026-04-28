@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -7,6 +8,7 @@ from . import vault
 from .admin import router as admin_router
 from .config import settings
 from .db import init_db
+from .scheduler import scheduler_loop
 from .simulate import router as simulate_router
 from .webhook import router as webhook_router
 
@@ -24,8 +26,19 @@ async def lifespan(app: FastAPI):
         await vault.init_vault()
     except Exception:
         log.exception("vault init falhou — bot vai funcionar sem contexto da paciente")
+
+    # Background scheduler task — envia ScheduledMessages quando chega o momento
+    scheduler_task = asyncio.create_task(scheduler_loop())
+
     log.info("Obstetra backend started (model=%s)", settings.anthropic_model)
-    yield
+    try:
+        yield
+    finally:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="Obstetra", lifespan=lifespan)

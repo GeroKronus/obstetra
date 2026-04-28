@@ -184,7 +184,7 @@ def _build_anamnese_md(data: dict) -> str:
         "hospital_referencia": data["hospital_referencia"],
         "plano_saude": data["plano_saude"],
         "contato_emergencia_nome": data.get("contato_emergencia_nome", ""),
-        "contato_emergencia_telefone": re.sub(r"\D", "", data.get("contato_emergencia_telefone", "") or ""),
+        "contato_emergencia_telefone": _clean_phone(data.get("contato_emergencia_telefone", "") or "") or "",
         "contato_emergencia_relacao": data.get("contato_emergencia_relacao", ""),
         "status": data.get("status", "ativa"),
         "preferencias_atendimento": data["preferencias_atendimento"],
@@ -202,10 +202,24 @@ def _build_anamnese_md(data: dict) -> str:
 
 
 def _clean_phone(raw: str) -> str | None:
+    """Normaliza telefone pro formato E.164 sem `+` (ex: 5528988030050).
+
+    Aceita como input:
+    - Apenas DDD + número (10-11 dígitos): adiciona '55' na frente
+    - Já com código do país (12-13 dígitos começando com 55): mantém
+    - Qualquer um com formatação ((28) 9 9999-9999, +55 28..., etc.)
+
+    Retorna E.164 sem `+`, ou None se não der pra normalizar."""
     digits = re.sub(r"\D", "", raw or "")
-    if len(digits) < 10 or len(digits) > 15:
+    if not digits:
         return None
-    return digits
+    # Já tem código do país
+    if digits.startswith("55") and 12 <= len(digits) <= 13:
+        return digits
+    # DDD + número (cellphone com 9 = 11 dígitos; landline = 10 dígitos)
+    if 10 <= len(digits) <= 11:
+        return "55" + digits
+    return None
 
 
 def _build_search_blob(fm: dict, body: str) -> str:

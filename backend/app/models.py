@@ -61,3 +61,18 @@ class Escalation(SQLModel, table=True):
     summary: str
     notified_doctor: bool = False
     created_at: datetime = Field(default_factory=utcnow)
+
+
+class ScheduledMessage(SQLModel, table=True):
+    """Mensagem agendada pra enviar a uma paciente em momento futuro.
+    Tipicamente criada pelo relay agent quando a Dra. pede um lembrete.
+    """
+    id: Optional[int] = Field(default=None, primary_key=True)
+    patient_id: int = Field(foreign_key="patient.id", index=True)
+    text: str
+    scheduled_at: datetime = Field(index=True)  # armazenado em UTC
+    sent_at: Optional[datetime] = Field(default=None, index=True)
+    cancelled_at: Optional[datetime] = None
+    error: Optional[str] = None
+    created_by: str = "doctor_relay"  # quem criou (futuro: admin, system, etc.)
+    created_at: datetime = Field(default_factory=utcnow)

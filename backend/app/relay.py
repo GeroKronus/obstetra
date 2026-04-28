@@ -14,16 +14,27 @@ outro contexto, outras tools.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import anthropic
+import frontmatter
 from sqlmodel import Session, select
 
 from .config import settings
-from .models import Escalation, Message, MessageDirection, Patient, utcnow
+from .models import (
+    Escalation,
+    Message,
+    MessageDirection,
+    Patient,
+    ScheduledMessage,
+    utcnow,
+)
 from .providers.base import WhatsAppProvider
+
+_BRT = ZoneInfo("America/Sao_Paulo")
 
 log = logging.getLogger("obstetra.relay")
 
@@ -77,35 +88,78 @@ RELAY_TOOLS: list[dict[str, Any]] = [
             "required": ["texto"],
         },
     },
+    {
+        "name": "agendar_lembrete",
+        "description": (
+            "Agenda um lembrete que será enviado AUTOMATICAMENTE à paciente no momento futuro especificado. "
+            "Use quando a doutora pedir 'lembre a [paciente] de [algo] em [horário]', 'avisa [paciente] amanhã às X', etc. "
+            "Você compõe a mensagem reformulada em primeira pessoa cordial pra paciente, começando com algo como "
+            "'Oi [Nome]! A Dra. Leiza pediu pra te lembrar de…' ou 'A Dra. Leiza me pediu pra te avisar que…'. "
+            "NUNCA encaminhe literal a fala da doutora — sempre reformule pra paciente."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "telefone": {
+                    "type": "string",
+                    "description": "Telefone da paciente em formato E.164 sem +, ex: 5528988030050. Tem que bater com a lista de pacientes no contexto.",
+                },
+                "momento_iso": {
+                    "type": "string",
+                    "description": (
+                        "Momento do envio em ISO 8601 com timezone, ex: '2026-04-26T11:00:00-03:00' "
+                        "(Brasília, UTC-3). A hora atual está no contexto — use ela pra calcular 'hoje', 'amanhã', etc. "
+                        "Se a doutora não especificar horário, use o que parecer razoável (ex: 'amanhã' = 9h da manhã)."
+                    ),
+                },
+                "mensagem": {
+                    "type": "string",
+                    "description": "Texto do lembrete a ser enviado à paciente, reformulado em primeira pessoa cordial.",
+                },
+            },
+            "required": ["telefone", "momento_iso", "mensagem"],
+        },
+    },
 ]
 
 
 _DEFAULT_RELAY_PROMPT = """\
 Você é assistente da {doctor_name}. Neste contexto, você está recebendo mensagens DA PRÓPRIA {doctor_name}, não de pacientes.
 
-A {doctor_name} costuma usar este canal para:
+A {doctor_name} costuma usar este canal para 4 coisas:
 
 1. **Encaminhar uma resposta dela à paciente** que você escalou recentemente. Ex:
    - "Responda à Patricia que entrarei em contato segunda."
    - "Diz pra ela que pode tomar dipirona."
    - "Mando ela vir aqui amanhã às 9h."
    Quando isso acontecer:
-   - Identifique a paciente correta. Geralmente é a mais recente da lista de escaladas. Se a doutora citar nome (Patricia, Maria, etc.), bate com a lista.
-   - **REFORMULE** a mensagem dela em primeira pessoa cordial e direta para a paciente. Comece com algo como "A {doctor_name} pediu pra te avisar que…" ou "A {doctor_name} me pediu pra te dizer que…". NUNCA encaminhe literal — a paciente não é a interlocutora original.
-   - Use a tool `encaminhar_para_paciente` com o telefone certo + a mensagem reformulada.
-   - Em seguida, use `responder_doutora` confirmando ("Encaminhei à Patricia").
+   - Identifique a paciente correta na lista do contexto.
+   - **REFORMULE** a mensagem dela em primeira pessoa cordial pra paciente, começando com "A {doctor_name} pediu pra te avisar…" ou similar. NUNCA encaminhe literal.
+   - Use `encaminhar_para_paciente` + depois `responder_doutora` confirmando.
 
-2. **Pergunta ou comando ambíguo** (qual paciente? não tem na lista? mensagem confusa?) — use `responder_doutora` pra pedir clarificação curta e objetiva.
+2. **Agendar um lembrete pra paciente em momento futuro.** Ex:
+   - "Lembre a Patricia de ir ao consultório hoje às 11h."
+   - "Avisa a Maria amanhã às 9h pra trazer os exames."
+   - "Lembrete pra Leiza: tomar dose dTpa daqui 3 dias."
+   Quando isso acontecer:
+   - Identifique a paciente.
+   - Calcule o `momento_iso` no fuso de São Paulo (UTC-3) usando a hora atual que está no contexto. "Hoje", "amanhã", "daqui 3 dias" — converta corretamente.
+   - Componha a mensagem reformulada pra paciente (primeira pessoa cordial), tipo: "Oi Patricia! A Dra. Leiza pediu pra te lembrar de [coisa] hoje às 11h. Te aguardo!"
+   - Use `agendar_lembrete(telefone, momento_iso, mensagem)`.
+   - Em seguida, use `responder_doutora` confirmando: "Agendado lembrete pra Patricia hoje às 11h."
 
-3. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado", etc.) — use `responder_doutora` com uma resposta curta. Se for um simples "ok" e não exige ação nem resposta, pode chamar `responder_doutora` com algo como "Combinado, doutora." ou só não chamar nada.
+3. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
+
+4. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
 
 **Princípios:**
-- A {doctor_name} é sua superior. Tom cordial e profissional, sempre conciso. Pode chamar de "doutora".
-- A lista de escaladas recentes (últimas 24h) está no contexto, com telefone + nome + resumo de cada caso. Use ela como verdade pra identificar a paciente.
-- Se houver SOMENTE UMA escalada recente e a doutora não especificar paciente, assuma que é essa.
-- Se houver várias e a mensagem for ambígua, pergunte qual.
-- Quando reformular pra paciente: tom acolhedor, primeira pessoa, sem jargão clínico.
-- SEMPRE confirme à doutora que a ação foi tomada — ela precisa saber que o pedido foi atendido.
+- A {doctor_name} é superior. Tom cordial-profissional, conciso. Pode chamar "doutora".
+- Lista de escaladas recentes + outras pacientes ativas + hora atual — tudo no contexto. Use como verdade.
+- Se SOMENTE UMA escalada recente e doutora não especifica paciente, assuma essa.
+- Se ambíguo entre várias, pergunte.
+- Reformulação pra paciente: tom acolhedor, primeira pessoa, sem jargão clínico.
+- SEMPRE confirme à doutora que a ação foi tomada.
+- Se o momento ficar no passado ou for inválido, pergunte clarificação em vez de agendar.
 """
 
 
@@ -124,7 +178,7 @@ def _recent_escalations_block(db: Session) -> str:
     ).all()
 
     if not rows:
-        return "<escaladas_recentes>Nenhuma escalada nas últimas 24h. Se a doutora pedir pra encaminhar algo, peça clarificação.</escaladas_recentes>"
+        return "<escaladas_recentes>Nenhuma escalada nas últimas 24h.</escaladas_recentes>"
 
     lines = ["<escaladas_recentes_24h>"]
     for esc, pat in rows:
@@ -135,6 +189,48 @@ def _recent_escalations_block(db: Session) -> str:
         )
     lines.append("</escaladas_recentes_24h>")
     return "\n".join(lines)
+
+
+def _active_patients_block() -> str:
+    """Lê o vault e lista pacientes ativas (nome + telefone) pra agente identificar
+    quando a doutora cita uma paciente que não está em escalada recente."""
+    vault_path = Path(settings.vault_local_path) / "pacientes"
+    if not vault_path.exists():
+        return "<pacientes_ativas>vault indisponível</pacientes_ativas>"
+
+    lines = ["<pacientes_ativas>"]
+    count = 0
+    for d in sorted(vault_path.iterdir()):
+        if not d.is_dir():
+            continue
+        anamnese = d / "anamnese.md"
+        if not anamnese.exists():
+            continue
+        try:
+            post = frontmatter.load(anamnese)
+            fm = post.metadata or {}
+        except Exception:
+            continue
+        if fm.get("status") and fm.get("status") != "ativa":
+            continue
+        nome = fm.get("nome") or d.name
+        lines.append(f"  - {nome} | telefone: {d.name}")
+        count += 1
+        if count >= 60:
+            break
+    lines.append("</pacientes_ativas>")
+    return "\n".join(lines)
+
+
+def _now_brt_block() -> str:
+    now_brt = datetime.now(_BRT)
+    weekday_pt = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"][now_brt.weekday()]
+    return (
+        f"<hora_atual_brasil>\n"
+        f"  iso: {now_brt.isoformat(timespec='minutes')}\n"
+        f"  legivel: {weekday_pt}, {now_brt.strftime('%d/%m/%Y às %H:%M')} (Brasília)\n"
+        f"</hora_atual_brasil>"
+    )
 
 
 class RelayAgent:
@@ -150,8 +246,15 @@ class RelayAgent:
         db: Session,
     ) -> None:
         system_prompt = _load_relay_system_prompt()
-        recent = _recent_escalations_block(db)
-        user_content = f"{recent}\n\n<mensagem_da_doutora>\n{text}\n</mensagem_da_doutora>"
+        context_parts = [
+            _now_brt_block(),
+            _recent_escalations_block(db),
+            _active_patients_block(),
+        ]
+        user_content = (
+            "\n\n".join(context_parts)
+            + f"\n\n<mensagem_da_doutora>\n{text}\n</mensagem_da_doutora>"
+        )
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
 
@@ -271,6 +374,47 @@ class RelayAgent:
                 return "Erro: DOCTOR_PHONE_NUMBER não configurado."
             await provider.send_text(settings.doctor_phone_number, texto)
             return "Resposta enviada à doutora."
+
+        if name == "agendar_lembrete":
+            telefone = str(arguments.get("telefone", "")).strip()
+            momento_iso = str(arguments.get("momento_iso", "")).strip()
+            mensagem = str(arguments.get("mensagem", "")).strip()
+            if not (telefone and momento_iso and mensagem):
+                return "Erro: telefone, momento_iso e mensagem são todos obrigatórios."
+
+            # Parse momento ISO; aceita forma com timezone ou assume BRT
+            try:
+                momento = datetime.fromisoformat(momento_iso)
+            except ValueError:
+                return f"Erro: momento_iso inválido ('{momento_iso}'). Use ISO 8601 com timezone, ex: 2026-04-26T11:00:00-03:00"
+            if momento.tzinfo is None:
+                momento = momento.replace(tzinfo=_BRT)
+            momento_utc = momento.astimezone(timezone.utc).replace(tzinfo=None)
+
+            # Valida que está no futuro
+            now_utc = utcnow()
+            if momento_utc <= now_utc:
+                return f"Erro: o momento {momento.isoformat()} já passou (hora atual {datetime.now(_BRT).isoformat(timespec='minutes')}). Confirme o horário com a doutora."
+
+            # Acha paciente
+            patient = db.exec(select(Patient).where(Patient.phone == telefone)).first()
+            if not patient:
+                return f"Erro: paciente com telefone {telefone} não está cadastrada. Verifique se o telefone bate com a lista de pacientes ativas."
+
+            # Cria agendamento
+            sched = ScheduledMessage(
+                patient_id=patient.id,
+                text=mensagem,
+                scheduled_at=momento_utc,
+                created_by="doctor_relay",
+            )
+            db.add(sched)
+            db.commit()
+            db.refresh(sched)
+
+            human_when = momento.astimezone(_BRT).strftime("%d/%m/%Y às %H:%M")
+            log.info("agendado lembrete id=%d para %s em %s", sched.id, telefone, human_when)
+            return f"Lembrete agendado pra {patient.name or telefone} em {human_when} (id={sched.id})."
 
         return f"Ferramenta desconhecida: {name}"
 

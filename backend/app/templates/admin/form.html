@@ -16,13 +16,13 @@
         </label>
         <div class="row">
             <label>
-                <span>Telefone (E.164 sem +) *</span>
-                <input type="tel" name="telefone" required pattern="\d{10,15}"
+                <span>Telefone *</span>
+                <input type="tel" name="telefone" required pattern="\d{10,13}"
                        inputmode="numeric" autocomplete="tel"
-                       placeholder="5511999990001"
+                       placeholder="28988030050"
                        value="{{ (patient.telefone if patient else '')|e }}"
                        {% if phone_lock %}readonly title="Telefone não pode ser alterado após cadastro"{% endif %}>
-                {% if phone_lock %}<p class="hint">Telefone bloqueado após cadastro.</p>{% endif %}
+                {% if phone_lock %}<p class="hint">Telefone bloqueado após cadastro.</p>{% else %}<p class="hint">DDD + número (ex: 28988030050). Não precisa colocar 55.</p>{% endif %}
             </label>
             <label>
                 <span>Data de nascimento</span>
@@ -157,10 +157,10 @@
         </div>
         <label>
             <span>Telefone</span>
-            <input type="tel" name="contato_emergencia_telefone" pattern="\d{10,15}"
-                   inputmode="numeric" placeholder="5511988887777"
+            <input type="tel" name="contato_emergencia_telefone" pattern="\d{10,13}"
+                   inputmode="numeric" placeholder="11988887777"
                    value="{{ (patient.contato_emergencia_telefone if patient else '')|e }}">
-            <p class="hint">E.164 sem o sinal de +.</p>
+            <p class="hint">DDD + número. Sem precisar do 55.</p>
         </label>
     </fieldset>
 
