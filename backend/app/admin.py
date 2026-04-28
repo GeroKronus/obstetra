@@ -339,7 +339,7 @@ async def admin_agenda(
     start_utc = start_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
     end_utc = end_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
-    from sqlmodel import Session
+    from sqlmodel import Session, select
     from .db import engine
     items: list[dict] = []
     with Session(engine) as db:
