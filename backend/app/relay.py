@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import anthropic
-import frontmatter
 from sqlmodel import Session, select
 
 from .config import settings
@@ -29,6 +27,7 @@ from .models import (
     Message,
     MessageDirection,
     Patient,
+    PatientStatus,
     ScheduledMessage,
     utcnow,
 )
@@ -271,33 +270,22 @@ def _recent_escalations_block(db: Session) -> str:
     return "\n".join(lines)
 
 
-def _active_patients_block() -> str:
-    """Lê o vault e lista pacientes ativas (nome + telefone) pra agente identificar
-    quando a doutora cita uma paciente que não está em escalada recente."""
-    vault_path = Path(settings.vault_local_path) / "pacientes"
-    if not vault_path.exists():
-        return "<pacientes_ativas>vault indisponível</pacientes_ativas>"
+def _active_patients_block(db: Session) -> str:
+    """Lista pacientes ativas (nome + telefone) — lido do DB."""
+    rows = db.exec(
+        select(Patient)
+        .where(Patient.status == PatientStatus.ATIVA)
+        .where(Patient.name.is_not(None))
+        .order_by(Patient.name)
+        .limit(60)
+    ).all()
+
+    if not rows:
+        return "<pacientes_ativas>nenhuma paciente ativa cadastrada</pacientes_ativas>"
 
     lines = ["<pacientes_ativas>"]
-    count = 0
-    for d in sorted(vault_path.iterdir()):
-        if not d.is_dir():
-            continue
-        anamnese = d / "anamnese.md"
-        if not anamnese.exists():
-            continue
-        try:
-            post = frontmatter.load(anamnese)
-            fm = post.metadata or {}
-        except Exception:
-            continue
-        if fm.get("status") and fm.get("status") != "ativa":
-            continue
-        nome = fm.get("nome") or d.name
-        lines.append(f"  - {nome} | telefone: {d.name}")
-        count += 1
-        if count >= 60:
-            break
+    for p in rows:
+        lines.append(f"  - {p.name} | telefone: {p.phone}")
     lines.append("</pacientes_ativas>")
     return "\n".join(lines)
 
@@ -341,29 +329,56 @@ def _pending_scheduled_block(db: Session) -> str:
     return "\n".join(lines)
 
 
-def _load_patient_anamnese(phone: str) -> tuple[str, str | None]:
-    """Le anamnese.md do vault da paciente. Retorna (texto_completo, nome_vault).
-    nome_vault e' o campo 'nome' do frontmatter, se existir."""
-    vault_path = Path(settings.vault_local_path) / "pacientes" / phone / "anamnese.md"
-    if not vault_path.exists():
-        return ("", None)
-    try:
-        post = frontmatter.load(vault_path)
-        fm = post.metadata or {}
-        body = (post.content or "").strip()
-        nome_vault = fm.get("nome") or None
-        fm_lines = []
-        for k, v in fm.items():
-            if v is None or v == "":
-                continue
-            fm_lines.append(f"{k}: {v}")
-        fm_text = "\n".join(fm_lines)
-        if fm_text and body:
-            return (f"{fm_text}\n\n---\n\n{body}", nome_vault)
-        return (fm_text or body, nome_vault)
-    except Exception:
-        log.exception("erro lendo anamnese de %s", phone)
-        return ("", None)
+def _format_patient_anamnese(patient: Patient) -> str:
+    """Renderiza a anamnese da Patient row como texto estruturado pro prompt."""
+    lines: list[str] = []
+
+    def _add(label: str, val: Any) -> None:
+        if val is None or (isinstance(val, str) and not val.strip()):
+            return
+        if hasattr(val, "value"):  # enum
+            val = val.value
+        lines.append(f"{label}: {val}")
+
+    _add("nome", patient.name)
+    _add("telefone", patient.phone)
+    _add("data_nascimento", patient.data_nascimento)
+    _add("endereco", patient.endereco)
+    _add("dum", patient.dum)
+    _add("tipo_gestacao", patient.tipo_gestacao)
+    _add("risco", patient.risco)
+    if patient.gestacao_planejada is not None:
+        _add("gestacao_planejada", patient.gestacao_planejada)
+    _add("gestational_weeks (cache)", patient.gestational_weeks)
+    _add("gestas", patient.gestas)
+    _add("partos_normais", patient.partos_normais)
+    _add("cesareas", patient.cesareas)
+    _add("abortos", patient.abortos)
+    _add("alergias", patient.alergias)
+    _add("condicoes_pre_existentes", patient.condicoes_pre_existentes)
+    _add("medicacoes_em_uso", patient.medicacoes_em_uso)
+    _add("grupo_sanguineo", patient.grupo_sanguineo)
+    _add("plano_saude", patient.plano_saude)
+    _add("hospital_referencia", patient.hospital_referencia)
+    _add("medico_obstetra", patient.medico_obstetra)
+    _add("contato_emergencia_nome", patient.contato_emergencia_nome)
+    _add("contato_emergencia_telefone", patient.contato_emergencia_telefone)
+    _add("contato_emergencia_relacao", patient.contato_emergencia_relacao)
+    _add("preferencias_atendimento", patient.preferencias_atendimento)
+
+    sections: list[str] = []
+    if patient.historico_clinico:
+        sections.append(f"## Histórico clínico relevante\n\n{patient.historico_clinico.strip()}")
+    if patient.historico_obstetrico:
+        sections.append(f"## Histórico obstétrico\n\n{patient.historico_obstetrico.strip()}")
+    if patient.observacoes_dra:
+        sections.append(f"## Observações pessoais da Dra.\n\n{patient.observacoes_dra.strip()}")
+
+    fm_text = "\n".join(lines)
+    body_text = "\n\n".join(sections)
+    if fm_text and body_text:
+        return f"{fm_text}\n\n---\n\n{body_text}"
+    return fm_text or body_text
 
 
 def _load_recent_messages(db: Session, patient_id: int, limit: int = 50) -> list[Message]:
@@ -433,12 +448,11 @@ async def _run_clinical_feedback(
     db: Session,
 ) -> str:
     """Chama Opus 4.7 com o historico da paciente e devolve a analise como string."""
-    anamnese, nome_vault = _load_patient_anamnese(patient.phone)
+    anamnese = _format_patient_anamnese(patient)
     messages = _load_recent_messages(db, patient.id or 0, limit=50)
     last_escalation = _load_recent_escalation(db, patient.id or 0)
 
-    # Nome: prefere DB > vault > telefone
-    display_name = patient.name or nome_vault or patient.phone
+    display_name = patient.name or patient.phone
 
     # Monta contexto
     parts: list[str] = []
@@ -526,7 +540,7 @@ class RelayAgent:
         context_parts = [
             _now_brt_block(),
             _recent_escalations_block(db),
-            _active_patients_block(),
+            _active_patients_block(db),
             _pending_scheduled_block(db),
         ]
         user_content = (

@@ -1,144 +1,35 @@
-"""Integração com o vault Obsidian (repositório Git).
+"""Modulo `vault` — historicamente lia anamnese de markdown em vault git.
 
-- Clona o vault no startup (se ainda não existir localmente).
-- Pull leve antes de cada leitura (com TTL pra evitar pull em rajada).
-- Lê `pacientes/<telefone>/anamnese.md` e parseia o frontmatter.
-- Append em `pacientes/<telefone>/conversas.md` com commit + push.
-
-Toda operação de git é serializada por um asyncio.Lock pra evitar conflitos
-de file lock e race conditions entre webhooks concorrentes.
+Apos a remocao do Obsidian (2026-04-28), os dados de paciente vivem no DB
+(tabela Patient). Este modulo e' agora um wrapper fino que mantem a API
+publica (PatientContext, read_patient, init_vault, append_conversation,
+commit_and_push) pra evitar refactor em cascata, mas todas as operacoes
+de filesystem/git foram removidas.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
-import shutil
-import stat
-import subprocess
-import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, timedelta
 from typing import Any
 
-import frontmatter
+from sqlmodel import Session, select
 
-from .config import settings
+from .db import engine
 
 log = logging.getLogger("obstetra.vault")
 
-_lock = asyncio.Lock()
-_last_pull_at: float = 0.0
-_ssh_key_path: Path | None = None
 
-
-def _is_enabled() -> bool:
-    return bool(settings.vault_repo_url and settings.vault_ssh_private_key)
-
-
-def _setup_ssh_key() -> str | None:
-    """Escreve a chave SSH em disco e retorna o GIT_SSH_COMMAND a usar."""
-    global _ssh_key_path
-    if not settings.vault_ssh_private_key:
-        return None
-    if _ssh_key_path and _ssh_key_path.exists():
-        return _git_ssh_command(_ssh_key_path)
-
-    key_dir = Path("/tmp/obstetra-ssh")
-    key_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key_path = key_dir / "vault_deploy_key"
-    key_path.write_text(settings.vault_ssh_private_key, encoding="utf-8", newline="\n")
-    key_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
-    _ssh_key_path = key_path
-    log.info("vault SSH key written to %s", key_path)
-    return _git_ssh_command(key_path)
-
-
-def _git_ssh_command(key_path: Path) -> str:
-    return (
-        f"ssh -i {key_path} "
-        "-o IdentitiesOnly=yes "
-        "-o StrictHostKeyChecking=no "
-        "-o UserKnownHostsFile=/dev/null"
-    )
-
-
-def _git_env() -> dict[str, str]:
-    env = os.environ.copy()
-    cmd = _setup_ssh_key()
-    if cmd:
-        env["GIT_SSH_COMMAND"] = cmd
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    return env
-
-
-def _run_git(args: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    log.debug("git %s (cwd=%s)", " ".join(args), cwd)
-    proc = subprocess.run(
-        ["git", *args],
-        cwd=str(cwd) if cwd else None,
-        env=_git_env(),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if check and proc.returncode != 0:
-        log.error("git %s failed (exit %d): stdout=%s stderr=%s",
-                  " ".join(args), proc.returncode, proc.stdout, proc.stderr)
-        raise RuntimeError(f"git {args[0]} failed: {proc.stderr.strip()}")
-    return proc
-
-
-def _vault_path() -> Path:
-    return Path(settings.vault_local_path)
-
-
-async def init_vault() -> None:
-    """Clona o vault no startup se ainda não estiver presente."""
-    if not _is_enabled():
-        log.info("vault disabled (VAULT_REPO_URL or VAULT_SSH_PRIVATE_KEY ausente) — bot funciona sem contexto da paciente")
-        return
-
-    async with _lock:
-        path = _vault_path()
-        if (path / ".git").exists():
-            log.info("vault já clonado em %s — fazendo pull inicial", path)
-            try:
-                _run_git(["pull", "--ff-only"], cwd=path)
-            except Exception:
-                log.exception("pull inicial falhou (vai tentar de novo na próxima leitura)")
-            return
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            shutil.rmtree(path)
-        log.info("clonando vault em %s", path)
-        _run_git(["clone", settings.vault_repo_url, str(path)])
-        _run_git(["config", "user.name", settings.vault_git_user_name], cwd=path)
-        _run_git(["config", "user.email", settings.vault_git_user_email], cwd=path)
-        log.info("vault clonado com sucesso")
-
-
-async def _pull_if_stale() -> None:
-    global _last_pull_at
-    now = time.time()
-    if now - _last_pull_at < settings.vault_pull_max_age_s:
-        return
-    path = _vault_path()
-    if not (path / ".git").exists():
-        return
-    try:
-        _run_git(["pull", "--ff-only"], cwd=path)
-        _last_pull_at = now
-    except Exception:
-        log.exception("vault pull falhou (mantendo cache local)")
-
+# =====================================================================
+# PatientContext — usado pelo agente principal de triagem
+# =====================================================================
 
 @dataclass
 class PatientContext:
-    """Dados estruturados que o bot lê do vault para contextualizar o atendimento."""
+    """Dados estruturados que o bot le do DB para contextualizar o atendimento.
+    Mantem o nome historico 'PatientContext' e o metodo to_prompt_block.
+    """
     found: bool
     nome: str | None = None
     semanas_atuais: int | None = None
@@ -200,117 +91,79 @@ class PatientContext:
         return "\n".join(lines)
 
 
-def _extract_section(body: str, heading: str) -> str | None:
-    """Extrai texto de uma seção (## Heading) até a próxima seção de mesmo nível."""
-    if not body:
+# =====================================================================
+# Helpers
+# =====================================================================
+
+def _split_csv_text(text: str | None) -> list[str] | None:
+    """Pega texto livre tipo 'penicilina, dipirona\\namoxicilina' e devolve lista."""
+    if not text:
         return None
-    lines = body.splitlines()
-    target = f"## {heading}".lower()
-    out: list[str] = []
-    capturing = False
-    for line in lines:
-        stripped = line.strip().lower()
-        if stripped.startswith("## "):
-            if capturing:
-                break
-            if stripped == target:
-                capturing = True
-                continue
-        if capturing:
-            out.append(line)
-    text = "\n".join(out).strip()
-    # remove os placeholders italicizados típicos do template
-    if text.startswith("*(") and text.endswith(")*") and "\n" not in text:
-        return None
-    return text or None
+    parts: list[str] = []
+    for chunk in text.replace(",", "\n").splitlines():
+        s = chunk.strip()
+        if s:
+            parts.append(s)
+    return parts or None
 
 
-def _parse_date(value: Any) -> date | None:
-    """Aceita objeto date (PyYAML deserializa datas ISO assim) ou string."""
-    if isinstance(value, date) and not isinstance(value, datetime):
-        return value
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, str) and value.strip():
-        try:
-            return date.fromisoformat(value.strip())
-        except ValueError:
-            return None
-    return None
+def _compute_gestational_data(dum: date | None, fallback_weeks: int | None) -> tuple[int | None, str | None]:
+    """A partir da DUM, calcula semanas atuais e DPP. Se DUM ausente, usa o fallback."""
+    if dum:
+        today = date.today()
+        delta_days = (today - dum).days
+        if delta_days >= 0:
+            semanas = delta_days // 7
+            dpp = (dum + timedelta(days=280)).isoformat()
+            return semanas, dpp
+    return fallback_weeks, None
 
 
-def _compute_gestational_data(dum: date | None) -> tuple[int | None, str | None]:
-    """A partir da DUM, calcula semanas atuais (inteiro) e DPP (DUM + 280 dias)."""
-    if not dum:
-        return None, None
-    today = date.today()
-    delta_days = (today - dum).days
-    if delta_days < 0:
-        # DUM no futuro — provavelmente erro de digitação; ignora
-        return None, None
-    semanas = delta_days // 7
-    dpp = (dum + timedelta(days=280)).isoformat()
-    return semanas, dpp
-
+# =====================================================================
+# Leitura de paciente — agora le do DB
+# =====================================================================
 
 async def read_patient(phone: str) -> PatientContext:
-    if not _is_enabled():
-        return PatientContext(found=False)
-
-    async with _lock:
-        await _pull_if_stale()
-        anamnese = _vault_path() / "pacientes" / phone / "anamnese.md"
-        if not anamnese.exists():
-            return PatientContext(found=False)
-        try:
-            post = frontmatter.load(anamnese)
-        except Exception:
-            log.exception("falha ao parsear %s", anamnese)
+    """Le o registro Patient do DB (filtro por telefone, no tenant default)."""
+    from .models import Patient
+    with Session(engine) as db:
+        # MVP single-tenant — pega o primeiro Patient com esse telefone (tenant_id=1)
+        pat = db.exec(
+            select(Patient).where(Patient.phone == phone)
+        ).first()
+        if not pat or not pat.name:
+            # Sem cadastro suficiente pra fornecer contexto util
             return PatientContext(found=False)
 
-    fm: dict[str, Any] = post.metadata or {}
-    body: str = post.content or ""
+        semanas, dpp = _compute_gestational_data(pat.dum, pat.gestational_weeks)
+        return PatientContext(
+            found=True,
+            nome=pat.name,
+            semanas_atuais=semanas,
+            tipo_gestacao=pat.tipo_gestacao,
+            risco=pat.risco,
+            data_provavel_parto=dpp,
+            alergias=_split_csv_text(pat.alergias),
+            condicoes_pre_existentes=_split_csv_text(pat.condicoes_pre_existentes),
+            medicacoes_em_uso=_split_csv_text(pat.medicacoes_em_uso),
+            preferencias_atendimento=pat.preferencias_atendimento,
+            historico_clinico=pat.historico_clinico,
+            historico_obstetrico=pat.historico_obstetrico,
+            observacoes_dra=pat.observacoes_dra,
+            hospital_referencia=pat.hospital_referencia,
+            contato_emergencia_nome=pat.contato_emergencia_nome,
+            contato_emergencia_telefone=pat.contato_emergencia_telefone,
+            contato_emergencia_relacao=pat.contato_emergencia_relacao,
+        )
 
-    def _list(field: str) -> list[str] | None:
-        value = fm.get(field)
-        if not value:
-            return None
-        if isinstance(value, list):
-            return [str(x) for x in value if x]
-        return [str(value)]
 
-    # DUM é a fonte da verdade — calcula semanas atuais e DPP em runtime.
-    # Se DUM não estiver presente, cai pros campos legados como fallback.
-    dum = _parse_date(fm.get("dum"))
-    semanas_calc, dpp_calc = _compute_gestational_data(dum)
+# =====================================================================
+# No-ops legados — mantidos pra nao quebrar callers
+# =====================================================================
 
-    semanas_final = semanas_calc if semanas_calc is not None else fm.get("semanas_atuais")
-    if dpp_calc:
-        dpp_final = dpp_calc
-    elif fm.get("data_provavel_parto"):
-        dpp_final = str(fm.get("data_provavel_parto"))
-    else:
-        dpp_final = None
-
-    return PatientContext(
-        found=True,
-        nome=fm.get("nome"),
-        semanas_atuais=semanas_final,
-        tipo_gestacao=fm.get("tipo_gestacao"),
-        risco=fm.get("risco"),
-        data_provavel_parto=dpp_final,
-        alergias=_list("alergias"),
-        condicoes_pre_existentes=_list("condicoes_pre_existentes"),
-        medicacoes_em_uso=_list("medicacoes_em_uso"),
-        preferencias_atendimento=fm.get("preferencias_atendimento") or None,
-        historico_clinico=_extract_section(body, "Histórico clínico relevante"),
-        historico_obstetrico=_extract_section(body, "Histórico obstétrico"),
-        observacoes_dra=_extract_section(body, "Observações pessoais da Dra."),
-        hospital_referencia=fm.get("hospital_referencia") or None,
-        contato_emergencia_nome=fm.get("contato_emergencia_nome") or None,
-        contato_emergencia_telefone=fm.get("contato_emergencia_telefone") or None,
-        contato_emergencia_relacao=fm.get("contato_emergencia_relacao") or None,
-    )
+async def init_vault() -> None:
+    """No-op desde 2026-04-28 (vault git aposentado)."""
+    log.debug("init_vault: no-op (vault git removido)")
 
 
 async def append_conversation(
@@ -320,129 +173,15 @@ async def append_conversation(
     outbound_messages: list[str],
     escalation_summary: str | None = None,
 ) -> None:
-    """Append uma entrada em pacientes/<phone>/conversas.md e push pro repo."""
-    if not _is_enabled():
-        return
-
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    chunks: list[str] = [f"## {timestamp}", ""]
-    for m in inbound_messages:
-        chunks.append(f"**Inbound**: {m}")
-    chunks.append("")
-    for m in outbound_messages:
-        chunks.append(f"**Outbound**: {m}")
-    if escalation_summary:
-        chunks.append("")
-        chunks.append(f"**Resultado**: {escalation_summary}")
-    chunks.append("")
-    chunks.append("---")
-    chunks.append("")
-    entry = "\n".join(chunks)
-
-    async with _lock:
-        await _pull_if_stale()
-        patient_dir = _vault_path() / "pacientes" / phone
-        patient_dir.mkdir(parents=True, exist_ok=True)
-        conversas = patient_dir / "conversas.md"
-        with conversas.open("a", encoding="utf-8") as f:
-            if conversas.stat().st_size == 0:
-                f.write(f"# Conversas — {phone}\n\n")
-            f.write(entry)
-
-        try:
-            _run_git(["add", str(conversas.relative_to(_vault_path()))], cwd=_vault_path())
-            _run_git(
-                ["commit", "-m", f"bot: conversa com {phone} em {timestamp}"],
-                cwd=_vault_path(),
-                check=False,  # se nada mudou (ex: paciente sem texto novo), não falha
-            )
-            _run_git(["push"], cwd=_vault_path())
-        except Exception:
-            log.exception("falha ao commitar/push da conversa de %s", phone)
+    """No-op desde 2026-04-28. Mensagens ja sao persistidas na tabela Message."""
+    pass
 
 
 async def commit_and_push(message: str) -> None:
-    """Commita tudo que estiver staged/modificado no vault e faz push.
-    Usado pelas rotas de admin que escrevem direto no markdown.
-    """
-    if not _is_enabled():
-        return
-    async with _lock:
-        try:
-            _run_git(["add", "-A"], cwd=_vault_path())
-            _run_git(["commit", "-m", message], cwd=_vault_path(), check=False)
-            _run_git(["push"], cwd=_vault_path())
-        except Exception:
-            log.exception("commit_and_push falhou: %s", message)
+    """No-op desde 2026-04-28."""
+    pass
 
 
-async def ensure_stub(phone: str, *, name_hint: str | None = None) -> None:
-    """Cria pacientes/<phone>/anamnese.md stub se ainda não existir.
-
-    Marcado com TODO pra Dra. revisar — útil quando a paciente não estava cadastrada
-    no vault e o bot capturou só pelo WhatsApp.
-    """
-    if not _is_enabled():
-        return
-
-    async with _lock:
-        await _pull_if_stale()
-        anamnese = _vault_path() / "pacientes" / phone / "anamnese.md"
-        if anamnese.exists():
-            return
-        anamnese.parent.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
-        nome_value = name_hint or ""
-        content = f'''---
-nome: "{nome_value}"
-telefone: "{phone}"
-data_nascimento:
-endereco: ""
-
-# DUM é a única fonte da verdade — semanas e DPP são calculados dinamicamente
-dum:
-tipo_gestacao:
-risco:
-gestacao_planejada:
-
-gestas: 0
-partos_normais: 0
-cesareas: 0
-abortos: 0
-
-alergias: []
-condicoes_pre_existentes: []
-medicacoes_em_uso: []
-grupo_sanguineo: ""
-
-medico_obstetra: "Dra. Leiza"
-hospital_referencia: ""
-plano_saude: ""
-
-status: ativa
-preferencias_atendimento: ""
-created_at: {timestamp}
-updated_at: {timestamp}
----
-
-# {nome_value or phone}
-
-> ⚠️ **Stub criado automaticamente pelo bot — Dra., por favor revisar e completar.**
->
-> Esta paciente entrou em contato pelo WhatsApp sem cadastro prévio no vault. Os dados aqui são placeholder. Edite, preencha o frontmatter e remova esta seção.
-
-## Histórico clínico relevante
-
-## Histórico obstétrico
-
-## Observações pessoais da Dra.
-
-## Plano de acompanhamento
-'''
-        anamnese.write_text(content, encoding="utf-8")
-        try:
-            _run_git(["add", str(anamnese.relative_to(_vault_path()))], cwd=_vault_path())
-            _run_git(["commit", "-m", f"bot: stub de paciente nova {phone}"], cwd=_vault_path(), check=False)
-            _run_git(["push"], cwd=_vault_path())
-        except Exception:
-            log.exception("falha ao commitar/push do stub de %s", phone)
+async def _pull_if_stale() -> None:
+    """No-op desde 2026-04-28."""
+    pass

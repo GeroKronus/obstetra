@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 
 from . import vault
 from .admin import router as admin_router
@@ -42,6 +43,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Obstetra", lifespan=lifespan)
+# GZip cuts response payload (HTML/CSS) ~7-10x, big win on Brazil↔US-East route
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.include_router(webhook_router)
 app.include_router(simulate_router)
 app.include_router(admin_router)

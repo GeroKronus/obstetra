@@ -1,13 +1,23 @@
 """Interface web admin para a secretária cadastrar/editar pacientes.
 
 Rotas:
-- GET  /admin/         — lista de pacientes
-- GET  /admin/novo     — formulário em branco
-- POST /admin/novo     — cria paciente
-- GET  /admin/{phone}  — formulário pré-preenchido
-- POST /admin/{phone}  — atualiza paciente
+- GET  /admin/                — lista de pacientes
+- GET  /admin/novo            — formulário em branco
+- POST /admin/novo            — cria paciente
+- GET  /admin/{phone}         — ficha pre-preenchida
+- POST /admin/{phone}         — atualiza paciente
+- GET  /admin/agenda          — visão dia/semana de consultas
+- GET  /admin/agenda/nova     — form nova consulta
+- POST /admin/agenda/nova     — cria consulta
+- GET  /admin/agenda/{id}/editar — edita consulta
+- POST /admin/agenda/{id}     — atualiza consulta
+- POST /admin/agenda/{id}/cancelar — cancela
+- GET  /admin/lembretes       — lista lembretes do dia
 
-Autenticação: HTTP Basic via env vars ADMIN_USER e ADMIN_PASSWORD.
+Autenticação: HTTP Basic. Credenciais lidas do Tenant default no DB
+(seedado a partir de ADMIN_USER/ADMIN_PASSWORD no env).
+
+Storage: tudo no DB (Postgres/SQLite). Sem vault, sem markdown.
 """
 
 from __future__ import annotations
@@ -15,18 +25,32 @@ from __future__ import annotations
 import logging
 import re
 import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
-import frontmatter
+import bcrypt
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.templating import Jinja2Templates
+from sqlmodel import Session, select
 
-from . import vault as vault_module
 from .config import settings
+from .db import engine
+from .models import (
+    Appointment,
+    AppointmentStatus,
+    AppointmentType,
+    OnboardingState,
+    Patient,
+    PatientStatus,
+    ScheduledMessage,
+    Tenant,
+    utcnow,
+)
+
 
 log = logging.getLogger("obstetra.admin")
 security = HTTPBasic()
@@ -36,42 +60,64 @@ templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
 
 router = APIRouter(prefix="/admin")
 
+DEFAULT_TENANT_ID = 1
 
-def verify_admin(credentials: Annotated[HTTPBasicCredentials, Depends(security)]) -> str:
-    if not settings.admin_user or not settings.admin_password:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Admin não configurado (ADMIN_USER/ADMIN_PASSWORD ausentes).",
+
+# =====================================================================
+# Auth — resolve credenciais do Tenant default no DB
+# =====================================================================
+
+def verify_admin(credentials: Annotated[HTTPBasicCredentials, Depends(security)]) -> int:
+    """Valida HTTP Basic contra Tenant.admin_user/admin_password_hash no DB.
+    Retorna o tenant_id correspondente. Fallback pra env se DB ausente."""
+    with Session(engine) as db:
+        tenant = db.exec(select(Tenant).where(Tenant.id == DEFAULT_TENANT_ID)).first()
+
+    if tenant:
+        user_match = secrets.compare_digest(
+            credentials.username.encode("utf-8"),
+            tenant.admin_user.encode("utf-8"),
         )
-    correct_user = secrets.compare_digest(
-        credentials.username.encode("utf-8"),
-        settings.admin_user.encode("utf-8"),
+        try:
+            pass_match = bcrypt.checkpw(
+                credentials.password.encode("utf-8"),
+                tenant.admin_password_hash.encode("utf-8"),
+            )
+        except Exception:
+            pass_match = False
+        if user_match and pass_match:
+            return tenant.id or DEFAULT_TENANT_ID
+
+    # Fallback pra env (caso bootstrap nao tenha rodado)
+    if settings.admin_user and settings.admin_password:
+        u = secrets.compare_digest(credentials.username.encode("utf-8"), settings.admin_user.encode("utf-8"))
+        p = secrets.compare_digest(credentials.password.encode("utf-8"), settings.admin_password.encode("utf-8"))
+        if u and p:
+            return DEFAULT_TENANT_ID
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Credenciais inválidas",
+        headers={"WWW-Authenticate": "Basic"},
     )
-    correct_pass = secrets.compare_digest(
-        credentials.password.encode("utf-8"),
-        settings.admin_password.encode("utf-8"),
-    )
-    if not (correct_user and correct_pass):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciais inválidas",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return credentials.username
 
 
-def _vault_pacientes_path() -> Path:
-    return Path(settings.vault_local_path) / "pacientes"
+# =====================================================================
+# Helpers
+# =====================================================================
 
-
-def _split_lines(text: str) -> list[str]:
-    return [line.strip() for line in (text or "").splitlines() if line.strip()]
-
-
-def _join_lines(items: list | None) -> str:
-    if not items:
-        return ""
-    return "\n".join(str(x) for x in items)
+def _clean_phone(raw: str) -> str | None:
+    """Normaliza telefone pro formato E.164 sem `+` (ex: 5528988030050).
+    Aceita DDD + número (10-11 dígitos) prependendo '55'.
+    """
+    digits = re.sub(r"\D", "", raw or "")
+    if not digits:
+        return None
+    if digits.startswith("55") and 12 <= len(digits) <= 13:
+        return digits
+    if 10 <= len(digits) <= 11:
+        return "55" + digits
+    return None
 
 
 def _date_str(value: Any) -> str:
@@ -82,228 +128,116 @@ def _date_str(value: Any) -> str:
     return str(value)
 
 
-def _parse_dum(value: Any) -> date | None:
-    """Aceita date, datetime ou string ISO 'YYYY-MM-DD'."""
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            return date.fromisoformat(value.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _extract_section(body: str, heading: str) -> str:
-    if not body:
-        return ""
-    target = f"## {heading}".lower()
-    out: list[str] = []
-    capturing = False
-    for line in body.splitlines():
-        if line.strip().lower().startswith("## "):
-            if capturing:
-                break
-            if line.strip().lower() == target:
-                capturing = True
-                continue
-        if capturing:
-            out.append(line)
-    return "\n".join(out).strip()
-
-
-def _load_patient(phone: str) -> dict | None:
-    """Lê pacientes/<phone>/anamnese.md e retorna como dict pronto pra template."""
-    path = _vault_pacientes_path() / phone / "anamnese.md"
-    if not path.exists():
+def _parse_date(value: str | None) -> date | None:
+    if not value:
         return None
     try:
-        post = frontmatter.load(path)
-    except Exception:
-        log.exception("falha ao parsear %s", path)
+        return date.fromisoformat(value.strip())
+    except ValueError:
         return None
-    fm = post.metadata or {}
-    body = post.content or ""
+
+
+def _parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _patient_to_dict(p: Patient) -> dict:
+    """Converte Patient row em dict pronto pra template (mesmas chaves que antes)."""
     return {
-        "nome": fm.get("nome", ""),
-        "telefone": fm.get("telefone", phone),
-        "data_nascimento": _date_str(fm.get("data_nascimento")),
-        "endereco": fm.get("endereco", ""),
-        "dum": _date_str(fm.get("dum")),
-        "tipo_gestacao": fm.get("tipo_gestacao", "unica"),
-        "risco": fm.get("risco", "habitual"),
-        "gestacao_planejada": bool(fm.get("gestacao_planejada", False)),
-        "gestas": fm.get("gestas", 0) or 0,
-        "partos_normais": fm.get("partos_normais", 0) or 0,
-        "cesareas": fm.get("cesareas", 0) or 0,
-        "abortos": fm.get("abortos", 0) or 0,
-        "alergias": _join_lines(fm.get("alergias")),
-        "condicoes_pre_existentes": _join_lines(fm.get("condicoes_pre_existentes")),
-        "medicacoes_em_uso": _join_lines(fm.get("medicacoes_em_uso")),
-        "grupo_sanguineo": fm.get("grupo_sanguineo", ""),
-        "medico_obstetra": fm.get("medico_obstetra", "Dra. Leiza"),
-        "hospital_referencia": fm.get("hospital_referencia", ""),
-        "plano_saude": fm.get("plano_saude", ""),
-        "contato_emergencia_nome": fm.get("contato_emergencia_nome", ""),
-        "contato_emergencia_telefone": fm.get("contato_emergencia_telefone", ""),
-        "contato_emergencia_relacao": fm.get("contato_emergencia_relacao", ""),
-        "preferencias_atendimento": fm.get("preferencias_atendimento", ""),
-        "historico_clinico": _extract_section(body, "Histórico clínico relevante"),
-        "historico_obstetrico": _extract_section(body, "Histórico obstétrico"),
-        "observacoes_dra": _extract_section(body, "Observações pessoais da Dra."),
-        "status": fm.get("status", "ativa"),
+        "nome": p.name or "",
+        "telefone": p.phone,
+        "data_nascimento": _date_str(p.data_nascimento),
+        "endereco": p.endereco or "",
+        "dum": _date_str(p.dum),
+        "tipo_gestacao": p.tipo_gestacao or "unica",
+        "risco": p.risco or "habitual",
+        "gestacao_planejada": bool(p.gestacao_planejada),
+        "gestas": p.gestas if p.gestas is not None else 0,
+        "partos_normais": p.partos_normais if p.partos_normais is not None else 0,
+        "cesareas": p.cesareas if p.cesareas is not None else 0,
+        "abortos": p.abortos if p.abortos is not None else 0,
+        "alergias": p.alergias or "",
+        "condicoes_pre_existentes": p.condicoes_pre_existentes or "",
+        "medicacoes_em_uso": p.medicacoes_em_uso or "",
+        "grupo_sanguineo": p.grupo_sanguineo or "",
+        "medico_obstetra": p.medico_obstetra or settings.doctor_name,
+        "hospital_referencia": p.hospital_referencia or "",
+        "plano_saude": p.plano_saude or "",
+        "contato_emergencia_nome": p.contato_emergencia_nome or "",
+        "contato_emergencia_telefone": p.contato_emergencia_telefone or "",
+        "contato_emergencia_relacao": p.contato_emergencia_relacao or "",
+        "preferencias_atendimento": p.preferencias_atendimento or "",
+        "historico_clinico": p.historico_clinico or "",
+        "historico_obstetrico": p.historico_obstetrico or "",
+        "observacoes_dra": p.observacoes_dra or "",
+        "status": p.status.value if hasattr(p.status, "value") else (p.status or "ativa"),
     }
 
 
-def _build_anamnese_md(data: dict) -> str:
-    """Monta o markdown completo (frontmatter + body) a partir do dict da requisição."""
-    now = datetime.now().isoformat(timespec="seconds")
-    # Converte datas pra objeto date — assim PyYAML escreve sem aspas
-    # (ex: 'dum: 2025-10-08' em vez de "dum: '2025-10-08'"), o que faz a
-    # leitura subsequente funcionar transparentemente.
-    fm = {
-        "nome": data["nome"],
-        "telefone": data["telefone"],
-        "data_nascimento": _parse_dum(data["data_nascimento"]) if data["data_nascimento"] else None,
-        "endereco": data["endereco"],
-        "dum": _parse_dum(data["dum"]) if data["dum"] else None,
-        "tipo_gestacao": data["tipo_gestacao"],
-        "risco": data["risco"],
-        "gestacao_planejada": data["gestacao_planejada"],
-        "gestas": data["gestas"],
-        "partos_normais": data["partos_normais"],
-        "cesareas": data["cesareas"],
-        "abortos": data["abortos"],
-        "alergias": _split_lines(data["alergias"]),
-        "condicoes_pre_existentes": _split_lines(data["condicoes_pre_existentes"]),
-        "medicacoes_em_uso": _split_lines(data["medicacoes_em_uso"]),
-        "grupo_sanguineo": data["grupo_sanguineo"],
-        "medico_obstetra": data["medico_obstetra"] or "Dra. Leiza",
-        "hospital_referencia": data["hospital_referencia"],
-        "plano_saude": data["plano_saude"],
-        "contato_emergencia_nome": data.get("contato_emergencia_nome", ""),
-        "contato_emergencia_telefone": _clean_phone(data.get("contato_emergencia_telefone", "") or "") or "",
-        "contato_emergencia_relacao": data.get("contato_emergencia_relacao", ""),
-        "status": data.get("status", "ativa"),
-        "preferencias_atendimento": data["preferencias_atendimento"],
-        "created_at": data.get("created_at", now),
-        "updated_at": now,
-    }
-    body = (
-        f"# {data['nome']}\n\n"
-        f"## Histórico clínico relevante\n\n{data['historico_clinico'].strip()}\n\n"
-        f"## Histórico obstétrico\n\n{data['historico_obstetrico'].strip()}\n\n"
-        f"## Observações pessoais da Dra.\n\n{data['observacoes_dra'].strip()}\n"
-    )
-    post = frontmatter.Post(content=body, **fm)
-    return frontmatter.dumps(post, allow_unicode=True, sort_keys=False)
+def _build_search_blob(p: Patient) -> str:
+    """Concatena todos os campos pesquisaveis num unico string lowercase."""
+    parts = [
+        p.name, p.phone, _date_str(p.data_nascimento), p.endereco,
+        p.tipo_gestacao, p.risco, p.grupo_sanguineo,
+        p.alergias, p.condicoes_pre_existentes, p.medicacoes_em_uso,
+        p.medico_obstetra, p.hospital_referencia, p.plano_saude,
+        p.contato_emergencia_nome, p.contato_emergencia_telefone, p.contato_emergencia_relacao,
+        p.preferencias_atendimento,
+        p.historico_clinico, p.historico_obstetrico, p.observacoes_dra,
+        (p.status.value if hasattr(p.status, "value") else str(p.status or "")),
+    ]
+    return " ".join(str(x) for x in parts if x).lower()
 
 
-def _clean_phone(raw: str) -> str | None:
-    """Normaliza telefone pro formato E.164 sem `+` (ex: 5528988030050).
-
-    Aceita como input:
-    - Apenas DDD + número (10-11 dígitos): adiciona '55' na frente
-    - Já com código do país (12-13 dígitos começando com 55): mantém
-    - Qualquer um com formatação ((28) 9 9999-9999, +55 28..., etc.)
-
-    Retorna E.164 sem `+`, ou None se não der pra normalizar."""
-    digits = re.sub(r"\D", "", raw or "")
-    if not digits:
-        return None
-    # Já tem código do país
-    if digits.startswith("55") and 12 <= len(digits) <= 13:
-        return digits
-    # DDD + número (cellphone com 9 = 11 dígitos; landline = 10 dígitos)
-    if 10 <= len(digits) <= 11:
-        return "55" + digits
-    return None
-
-
-def _build_search_blob(fm: dict, body: str) -> str:
-    """Concatena todos os campos pesquisaveis num unico string normalizado em lowercase."""
-    parts: list[str] = []
-
-    def _add(value):
-        if not value:
-            return
-        if isinstance(value, list):
-            parts.extend(str(v) for v in value if v)
-        else:
-            parts.append(str(value))
-
-    for key in (
-        "nome", "telefone", "data_nascimento", "endereco",
-        "tipo_gestacao", "risco", "grupo_sanguineo",
-        "alergias", "condicoes_pre_existentes", "medicacoes_em_uso",
-        "medico_obstetra", "hospital_referencia", "plano_saude",
-        "contato_emergencia_nome", "contato_emergencia_telefone",
-        "contato_emergencia_relacao",
-        "preferencias_atendimento", "status",
-    ):
-        _add(fm.get(key))
-
-    if body:
-        parts.append(body)
-
-    return " ".join(parts).lower()
-
+# =====================================================================
+# Listagem
+# =====================================================================
 
 @router.get("/", response_class=HTMLResponse)
 async def admin_index(
     request: Request,
     q: str = "",
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
 ):
-    # Pull antes de listar pra ter dados frescos
-    try:
-        await vault_module._pull_if_stale()
-    except Exception:
-        log.exception("pull no /admin/ falhou — listando do cache local")
-
     query = (q or "").strip().lower()
-    pacientes_dir = _vault_pacientes_path()
     patients: list[dict] = []
     total = 0
+    today = date.today()
 
-    if pacientes_dir.exists():
-        for d in sorted(pacientes_dir.iterdir()):
-            if not d.is_dir():
-                continue
-            anamnese = d / "anamnese.md"
-            if not anamnese.exists():
-                continue
-            try:
-                post = frontmatter.load(anamnese)
-                fm = post.metadata or {}
-                body = post.content or ""
-            except Exception:
-                log.exception("erro lendo %s", anamnese)
-                continue
+    with Session(engine) as db:
+        rows = db.exec(
+            select(Patient)
+            .where(Patient.tenant_id == tenant_id)
+            .where(Patient.name.is_not(None))
+            .order_by(Patient.name)
+        ).all()
+        total = len(rows)
 
-            total += 1
-
-            # Filtra ANTES de montar o card (evita custo de renderizar o que vai sumir)
+        for p in rows:
             if query:
-                blob = _build_search_blob(fm, body)
+                blob = _build_search_blob(p)
                 if query not in blob:
                     continue
 
-            dum = _parse_dum(fm.get("dum"))
+            # Semanas a partir da DUM (preferida) ou fallback
             semanas: int | None = None
-            if dum:
-                delta = (date.today() - dum).days
-                semanas = delta // 7 if delta >= 0 else None
+            if p.dum:
+                delta = (today - p.dum).days
+                if delta >= 0:
+                    semanas = delta // 7
+            elif p.gestational_weeks is not None:
+                semanas = p.gestational_weeks
 
             patients.append({
-                "phone": d.name,
-                "nome": fm.get("nome") or d.name,
+                "phone": p.phone,
+                "nome": p.name,
                 "semanas": semanas,
-                "tipo": fm.get("tipo_gestacao", "-"),
-                "risco": fm.get("risco", "-"),
-                "status": fm.get("status", "ativa"),
+                "tipo": p.tipo_gestacao or "-",
+                "risco": p.risco or "-",
+                "status": (p.status.value if hasattr(p.status, "value") else (p.status or "ativa")),
             })
 
     return templates.TemplateResponse(
@@ -313,9 +247,21 @@ async def admin_index(
     )
 
 
+@router.get("/novo", response_class=HTMLResponse)
+async def admin_novo_form(request: Request, _: int = Depends(verify_admin)):
+    return templates.TemplateResponse(
+        request,
+        "admin/form.html",
+        {"patient": None, "phone_lock": False, "error": None},
+    )
+
+
+# =====================================================================
+# Agenda
+# =====================================================================
+
 def _day_window_utc(target_date: date) -> tuple[datetime, datetime]:
-    """Retorna (start_utc, end_utc) naive cobrindo BRT 00:00 a 23:59 do dia."""
-    from zoneinfo import ZoneInfo
+    """(start_utc, end_utc) cobrindo BRT 00:00 a 23:59 do dia."""
     brt = ZoneInfo("America/Sao_Paulo")
     start_brt = datetime.combine(target_date, datetime.min.time(), tzinfo=brt)
     end_brt = datetime.combine(target_date, datetime.max.time(), tzinfo=brt)
@@ -326,8 +272,6 @@ def _day_window_utc(target_date: date) -> tuple[datetime, datetime]:
 
 
 def _parse_target_date(data: str) -> date:
-    """Parseia ?data=YYYY-MM-DD; fallback pra hoje BRT."""
-    from zoneinfo import ZoneInfo
     brt = ZoneInfo("America/Sao_Paulo")
     if data:
         try:
@@ -338,8 +282,6 @@ def _parse_target_date(data: str) -> date:
 
 
 def _monday_of_week(d: date) -> date:
-    """Retorna a segunda-feira da semana que contem 'd'."""
-    from datetime import timedelta
     return d - timedelta(days=d.weekday())
 
 
@@ -349,17 +291,11 @@ async def admin_agenda(
     data: str = "",
     vista: str = "dia",
     inicio: str = "",
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
 ):
-    """Agenda de consultas. vista=dia (default) ou vista=semana."""
+    """vista=dia (default) ou vista=semana"""
     if vista == "semana":
-        return await _admin_agenda_semana(request, inicio)
-
-    from datetime import timedelta
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, Patient
+        return await _admin_agenda_semana(request, inicio, tenant_id)
 
     brt = ZoneInfo("America/Sao_Paulo")
     target_date = _parse_target_date(data)
@@ -370,6 +306,7 @@ async def admin_agenda(
         rows = db.exec(
             select(Appointment, Patient)
             .join(Patient, Appointment.patient_id == Patient.id)
+            .where(Appointment.tenant_id == tenant_id)
             .where(Appointment.scheduled_at >= start_utc)
             .where(Appointment.scheduled_at <= end_utc)
             .order_by(Appointment.scheduled_at)
@@ -406,24 +343,15 @@ async def admin_agenda(
     )
 
 
-async def _admin_agenda_semana(request: Request, inicio: str) -> HTMLResponse:
-    """Visao semanal: 7 dias agrupados, da segunda ao domingo."""
-    from datetime import timedelta
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, Patient
-
+async def _admin_agenda_semana(request: Request, inicio: str, tenant_id: int) -> HTMLResponse:
     brt = ZoneInfo("America/Sao_Paulo")
     base_date = _parse_target_date(inicio)
     week_start = _monday_of_week(base_date)
     week_end = week_start + timedelta(days=6)
 
-    # Janela UTC cobrindo segunda 00:00 BRT a domingo 23:59 BRT
     start_utc, _ = _day_window_utc(week_start)
     _, end_utc = _day_window_utc(week_end)
 
-    # Inicializa estrutura por dia
     days: list[dict] = []
     for i in range(7):
         d = week_start + timedelta(days=i)
@@ -438,6 +366,7 @@ async def _admin_agenda_semana(request: Request, inicio: str) -> HTMLResponse:
         rows = db.exec(
             select(Appointment, Patient)
             .join(Patient, Appointment.patient_id == Patient.id)
+            .where(Appointment.tenant_id == tenant_id)
             .where(Appointment.scheduled_at >= start_utc)
             .where(Appointment.scheduled_at <= end_utc)
             .order_by(Appointment.scheduled_at)
@@ -483,21 +412,35 @@ async def _admin_agenda_semana(request: Request, inicio: str) -> HTMLResponse:
     )
 
 
+def _list_active_patients(tenant_id: int) -> list[dict]:
+    """Lista pacientes ativas (nome + phone) — usado em selects de form."""
+    out: list[dict] = []
+    with Session(engine) as db:
+        rows = db.exec(
+            select(Patient)
+            .where(Patient.tenant_id == tenant_id)
+            .where(Patient.name.is_not(None))
+            .where(Patient.status == PatientStatus.ATIVA)
+            .order_by(Patient.name)
+        ).all()
+        for p in rows:
+            out.append({"phone": p.phone, "nome": p.name})
+    return out
+
+
 @router.get("/agenda/nova", response_class=HTMLResponse)
 async def admin_agenda_nova_form(
     request: Request,
     paciente: str = "",
     data: str = "",
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
 ):
-    """Form de nova consulta. Aceita ?paciente=<phone>&data=YYYY-MM-DD pra pre-preencher."""
-    pacientes = _list_active_patients()
     return templates.TemplateResponse(
         request,
         "admin/agenda_form.html",
         {
             "appointment": None,
-            "pacientes": pacientes,
+            "pacientes": _list_active_patients(tenant_id),
             "preset_phone": paciente or "",
             "preset_date": data or "",
             "error": None,
@@ -507,7 +450,7 @@ async def admin_agenda_nova_form(
 
 @router.post("/agenda/nova")
 async def admin_agenda_nova_submit(
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
     paciente: str = Form(...),
     data_consulta: str = Form(...),
     hora_consulta: str = Form(...),
@@ -515,11 +458,6 @@ async def admin_agenda_nova_submit(
     tipo: str = Form("consulta"),
     obs: str = Form(""),
 ):
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, AppointmentType, Patient
-
     brt = ZoneInfo("America/Sao_Paulo")
     cleaned_phone = _clean_phone(paciente)
     if not cleaned_phone:
@@ -534,32 +472,17 @@ async def admin_agenda_nova_submit(
 
     when_utc = when_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
-    # Verifica se paciente existe no vault (ficha)
-    vault_anamnese = _vault_pacientes_path() / cleaned_phone / "anamnese.md"
-    if not vault_anamnese.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Paciente com telefone {cleaned_phone} não está cadastrada. Cadastre primeiro em /admin/novo.",
-        )
-
     with Session(engine) as db:
-        patient = db.exec(select(Patient).where(Patient.phone == cleaned_phone)).first()
+        patient = db.exec(
+            select(Patient)
+            .where(Patient.tenant_id == tenant_id)
+            .where(Patient.phone == cleaned_phone)
+        ).first()
         if not patient:
-            # Cria Patient no DB a partir da ficha do vault — secretaria
-            # pode cadastrar e ja agendar antes da paciente conversar
-            from .models import OnboardingState
-            try:
-                fm = frontmatter.load(vault_anamnese).metadata or {}
-            except Exception:
-                fm = {}
-            patient = Patient(
-                phone=cleaned_phone,
-                name=fm.get("nome") or None,
-                onboarding_state=OnboardingState.DONE,
+            raise HTTPException(
+                status_code=400,
+                detail=f"Paciente com telefone {cleaned_phone} não está cadastrada. Cadastre primeiro.",
             )
-            db.add(patient)
-            db.commit()
-            db.refresh(patient)
 
         try:
             tipo_enum = AppointmentType(tipo)
@@ -567,6 +490,7 @@ async def admin_agenda_nova_submit(
             tipo_enum = AppointmentType.CONSULTA
 
         ap = Appointment(
+            tenant_id=tenant_id,
             patient_id=patient.id or 0,
             scheduled_at=when_utc,
             duracao_min=max(5, int(duracao_min)),
@@ -585,19 +509,15 @@ async def admin_agenda_nova_submit(
 async def admin_agenda_editar_form(
     appt_id: int,
     request: Request,
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
 ):
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, Patient
-
     brt = ZoneInfo("America/Sao_Paulo")
     with Session(engine) as db:
         row = db.exec(
             select(Appointment, Patient)
             .join(Patient, Appointment.patient_id == Patient.id)
             .where(Appointment.id == appt_id)
+            .where(Appointment.tenant_id == tenant_id)
         ).first()
         if not row:
             raise HTTPException(status_code=404, detail="Consulta não encontrada")
@@ -631,7 +551,7 @@ async def admin_agenda_editar_form(
 @router.post("/agenda/{appt_id}")
 async def admin_agenda_editar_submit(
     appt_id: int,
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
     data_consulta: str = Form(...),
     hora_consulta: str = Form(...),
     duracao_min: int = Form(30),
@@ -639,11 +559,6 @@ async def admin_agenda_editar_submit(
     obs: str = Form(""),
     status_consulta: str = Form("agendada"),
 ):
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, AppointmentStatus, AppointmentType, utcnow
-
     brt = ZoneInfo("America/Sao_Paulo")
     try:
         d = date.fromisoformat(data_consulta.strip())
@@ -654,7 +569,11 @@ async def admin_agenda_editar_submit(
     when_utc = when_brt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
     with Session(engine) as db:
-        ap = db.exec(select(Appointment).where(Appointment.id == appt_id)).first()
+        ap = db.exec(
+            select(Appointment)
+            .where(Appointment.id == appt_id)
+            .where(Appointment.tenant_id == tenant_id)
+        ).first()
         if not ap:
             raise HTTPException(status_code=404, detail="Consulta não encontrada")
 
@@ -682,14 +601,14 @@ async def admin_agenda_editar_submit(
 @router.post("/agenda/{appt_id}/cancelar")
 async def admin_agenda_cancelar(
     appt_id: int,
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
 ):
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, AppointmentStatus, utcnow
-
     with Session(engine) as db:
-        ap = db.exec(select(Appointment).where(Appointment.id == appt_id)).first()
+        ap = db.exec(
+            select(Appointment)
+            .where(Appointment.id == appt_id)
+            .where(Appointment.tenant_id == tenant_id)
+        ).first()
         if not ap:
             raise HTTPException(status_code=404, detail="Consulta não encontrada")
         ap.status = AppointmentStatus.CANCELADA
@@ -702,19 +621,16 @@ async def admin_agenda_cancelar(
     return RedirectResponse(url=f"/admin/agenda?data={d_iso}", status_code=303)
 
 
+# =====================================================================
+# Lembretes (ScheduledMessage — mensagens automáticas)
+# =====================================================================
+
 @router.get("/lembretes", response_class=HTMLResponse)
 async def admin_lembretes(
     request: Request,
     data: str = "",
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
 ):
-    """Lista lembretes (ScheduledMessage) por dia — diferente de consultas."""
-    from datetime import timedelta
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import ScheduledMessage, Patient
-
     brt = ZoneInfo("America/Sao_Paulo")
     target_date = _parse_target_date(data)
     start_utc, end_utc = _day_window_utc(target_date)
@@ -724,6 +640,7 @@ async def admin_lembretes(
         rows = db.exec(
             select(ScheduledMessage, Patient)
             .join(Patient, ScheduledMessage.patient_id == Patient.id)
+            .where(ScheduledMessage.tenant_id == tenant_id)
             .where(ScheduledMessage.scheduled_at >= start_utc)
             .where(ScheduledMessage.scheduled_at <= end_utc)
             .order_by(ScheduledMessage.scheduled_at)
@@ -764,83 +681,57 @@ async def admin_lembretes(
     )
 
 
-def _list_active_patients() -> list[dict]:
-    """Le vault e retorna pacientes ativas (nome + phone) pra select do form."""
-    pacientes_dir = _vault_pacientes_path()
-    out: list[dict] = []
-    if not pacientes_dir.exists():
-        return out
-    for d in sorted(pacientes_dir.iterdir()):
-        if not d.is_dir():
-            continue
-        anamnese = d / "anamnese.md"
-        if not anamnese.exists():
-            continue
-        try:
-            post = frontmatter.load(anamnese)
-            fm = post.metadata or {}
-        except Exception:
-            continue
-        if fm.get("status") and fm.get("status") != "ativa":
-            continue
-        out.append({"phone": d.name, "nome": fm.get("nome") or d.name})
-    return out
-
-
-@router.get("/novo", response_class=HTMLResponse)
-async def admin_novo_form(request: Request, _: str = Depends(verify_admin)):
-    return templates.TemplateResponse(
-        request,
-        "admin/form.html",
-        {"patient": None, "phone_lock": False, "error": None},
-    )
-
+# =====================================================================
+# Ficha individual (paciente)
+# =====================================================================
 
 @router.get("/{phone}", response_class=HTMLResponse)
-async def admin_edit_form(phone: str, request: Request, _: str = Depends(verify_admin)):
-    from zoneinfo import ZoneInfo
-    from sqlmodel import Session, select
-    from .db import engine
-    from .models import Appointment, Patient
-
-    patient = _load_patient(phone)
-    if not patient:
-        raise HTTPException(status_code=404, detail="Paciente não encontrada")
-
-    # Carrega consultas (proximas + historico)
-    proximas: list[dict] = []
-    historico: list[dict] = []
+async def admin_edit_form(
+    phone: str,
+    request: Request,
+    tenant_id: int = Depends(verify_admin),
+):
     brt = ZoneInfo("America/Sao_Paulo")
-    now_utc = datetime.utcnow()
     with Session(engine) as db:
-        pat_row = db.exec(select(Patient).where(Patient.phone == phone)).first()
-        if pat_row:
-            rows = db.exec(
-                select(Appointment)
-                .where(Appointment.patient_id == pat_row.id)
-                .order_by(Appointment.scheduled_at.desc())
-            ).all()
-            for ap in rows:
-                when_brt = ap.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
-                item = {
-                    "id": ap.id,
-                    "quando": when_brt.strftime("%d/%m/%Y %H:%M"),
-                    "tipo": ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo),
-                    "obs": ap.obs or "",
-                    "status": ap.status.value if hasattr(ap.status, "value") else str(ap.status),
-                }
-                # Proximas: agendada/confirmada e no futuro
-                if ap.scheduled_at >= now_utc and ap.status.value in ("agendada", "confirmada"):
-                    proximas.append(item)
-                else:
-                    historico.append(item)
-            proximas.reverse()  # cronologica ascendente
+        pat = db.exec(
+            select(Patient)
+            .where(Patient.tenant_id == tenant_id)
+            .where(Patient.phone == phone)
+        ).first()
+        if not pat:
+            raise HTTPException(status_code=404, detail="Paciente não encontrada")
+
+        # Consultas (proximas + historico)
+        proximas: list[dict] = []
+        historico: list[dict] = []
+        now_utc = datetime.utcnow()
+        rows = db.exec(
+            select(Appointment)
+            .where(Appointment.tenant_id == tenant_id)
+            .where(Appointment.patient_id == pat.id)
+            .order_by(Appointment.scheduled_at.desc())
+        ).all()
+        for ap in rows:
+            when_brt = ap.scheduled_at.replace(tzinfo=ZoneInfo("UTC")).astimezone(brt)
+            item = {
+                "id": ap.id,
+                "quando": when_brt.strftime("%d/%m/%Y %H:%M"),
+                "tipo": ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo),
+                "obs": ap.obs or "",
+                "status": ap.status.value if hasattr(ap.status, "value") else str(ap.status),
+            }
+            status_v = ap.status.value if hasattr(ap.status, "value") else str(ap.status)
+            if ap.scheduled_at >= now_utc and status_v in ("agendada", "confirmada"):
+                proximas.append(item)
+            else:
+                historico.append(item)
+        proximas.reverse()
 
     return templates.TemplateResponse(
         request,
         "admin/form.html",
         {
-            "patient": patient,
+            "patient": _patient_to_dict(pat),
             "phone_lock": True,
             "error": None,
             "consultas_proximas": proximas,
@@ -849,40 +740,74 @@ async def admin_edit_form(phone: str, request: Request, _: str = Depends(verify_
     )
 
 
-async def _save_patient_form(phone_url: str | None, form: dict) -> RedirectResponse:
+# =====================================================================
+# Salvar paciente (criar/atualizar)
+# =====================================================================
+
+def _apply_form_to_patient(p: Patient, form: dict) -> None:
+    """Copia valores do form pro modelo Patient (in-place)."""
+    p.name = (form.get("nome") or "").strip() or None
+    p.data_nascimento = _parse_date(form.get("data_nascimento"))
+    p.endereco = (form.get("endereco") or "").strip() or None
+    p.dum = _parse_date(form.get("dum"))
+    p.tipo_gestacao = (form.get("tipo_gestacao") or "unica").strip()
+    p.risco = (form.get("risco") or "habitual").strip()
+    p.gestacao_planejada = bool(form.get("gestacao_planejada"))
+    p.gestas = _parse_int(form.get("gestas"), 0)
+    p.partos_normais = _parse_int(form.get("partos_normais"), 0)
+    p.cesareas = _parse_int(form.get("cesareas"), 0)
+    p.abortos = _parse_int(form.get("abortos"), 0)
+    p.alergias = (form.get("alergias") or "").strip() or None
+    p.condicoes_pre_existentes = (form.get("condicoes_pre_existentes") or "").strip() or None
+    p.medicacoes_em_uso = (form.get("medicacoes_em_uso") or "").strip() or None
+    p.grupo_sanguineo = (form.get("grupo_sanguineo") or "").strip() or None
+    p.medico_obstetra = (form.get("medico_obstetra") or settings.doctor_name).strip() or None
+    p.hospital_referencia = (form.get("hospital_referencia") or "").strip() or None
+    p.plano_saude = (form.get("plano_saude") or "").strip() or None
+    p.contato_emergencia_nome = (form.get("contato_emergencia_nome") or "").strip() or None
+    contato_tel = form.get("contato_emergencia_telefone") or ""
+    p.contato_emergencia_telefone = _clean_phone(contato_tel) or (contato_tel.strip() or None)
+    p.contato_emergencia_relacao = (form.get("contato_emergencia_relacao") or "").strip() or None
+    p.preferencias_atendimento = (form.get("preferencias_atendimento") or "").strip() or None
+    p.historico_clinico = (form.get("historico_clinico") or "").strip() or None
+    p.historico_obstetrico = (form.get("historico_obstetrico") or "").strip() or None
+    p.observacoes_dra = (form.get("observacoes_dra") or "").strip() or None
+    p.updated_at = utcnow()
+
+
+async def _save_patient(phone_url: str | None, form: dict, tenant_id: int) -> RedirectResponse:
     cleaned_phone = _clean_phone(form["telefone"])
     if not cleaned_phone:
         raise HTTPException(status_code=400, detail="Telefone inválido. Use formato E.164 sem +, ex: 5511999990001")
     if phone_url and phone_url != cleaned_phone:
-        # Telefone mudou em uma edição — bloqueia (renomear pasta é intrusivo)
         raise HTTPException(status_code=400, detail="Não é permitido alterar o telefone. Crie uma nova ficha se necessário.")
 
-    target_dir = _vault_pacientes_path() / cleaned_phone
-    is_new = not (target_dir / "anamnese.md").exists()
-    target_dir.mkdir(parents=True, exist_ok=True)
+    with Session(engine) as db:
+        existing = db.exec(
+            select(Patient)
+            .where(Patient.tenant_id == tenant_id)
+            .where(Patient.phone == cleaned_phone)
+        ).first()
 
-    # Preserva created_at se já existir
-    if not is_new:
-        try:
-            existing = frontmatter.load(target_dir / "anamnese.md").metadata or {}
-            form["created_at"] = existing.get("created_at") or datetime.now().isoformat(timespec="seconds")
-            form["status"] = existing.get("status", "ativa")
-        except Exception:
-            pass
-
-    form["telefone"] = cleaned_phone
-    md = _build_anamnese_md(form)
-    (target_dir / "anamnese.md").write_text(md, encoding="utf-8")
-
-    verb = "cadastro" if is_new else "atualização"
-    await vault_module.commit_and_push(f"admin: {verb} de {form['nome']} ({cleaned_phone})")
+        if existing:
+            _apply_form_to_patient(existing, form)
+            db.add(existing)
+        else:
+            new_patient = Patient(
+                tenant_id=tenant_id,
+                phone=cleaned_phone,
+                onboarding_state=OnboardingState.DONE,  # cadastro pelo painel = onboarding completo
+            )
+            _apply_form_to_patient(new_patient, form)
+            db.add(new_patient)
+        db.commit()
 
     return RedirectResponse(url=f"/admin/?ok={cleaned_phone}", status_code=303)
 
 
 @router.post("/novo")
 async def admin_novo_submit(
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
     nome: str = Form(...),
     telefone: str = Form(...),
     data_nascimento: str = Form(""),
@@ -899,7 +824,7 @@ async def admin_novo_submit(
     condicoes_pre_existentes: str = Form(""),
     medicacoes_em_uso: str = Form(""),
     grupo_sanguineo: str = Form(""),
-    medico_obstetra: str = Form("Dra. Leiza"),
+    medico_obstetra: str = Form(""),
     hospital_referencia: str = Form(""),
     plano_saude: str = Form(""),
     contato_emergencia_nome: str = Form(""),
@@ -910,13 +835,13 @@ async def admin_novo_submit(
     historico_obstetrico: str = Form(""),
     observacoes_dra: str = Form(""),
 ):
-    return await _save_patient_form(None, locals())
+    return await _save_patient(None, locals(), tenant_id)
 
 
 @router.post("/{phone}")
 async def admin_edit_submit(
     phone: str,
-    _: str = Depends(verify_admin),
+    tenant_id: int = Depends(verify_admin),
     nome: str = Form(...),
     telefone: str = Form(...),
     data_nascimento: str = Form(""),
@@ -933,7 +858,7 @@ async def admin_edit_submit(
     condicoes_pre_existentes: str = Form(""),
     medicacoes_em_uso: str = Form(""),
     grupo_sanguineo: str = Form(""),
-    medico_obstetra: str = Form("Dra. Leiza"),
+    medico_obstetra: str = Form(""),
     hospital_referencia: str = Form(""),
     plano_saude: str = Form(""),
     contato_emergencia_nome: str = Form(""),
@@ -944,4 +869,4 @@ async def admin_edit_submit(
     historico_obstetrico: str = Form(""),
     observacoes_dra: str = Form(""),
 ):
-    return await _save_patient_form(phone, locals())
+    return await _save_patient(phone, locals(), tenant_id)
