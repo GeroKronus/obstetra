@@ -23,6 +23,9 @@ from sqlmodel import Session, select
 
 from .config import settings
 from .models import (
+    Appointment,
+    AppointmentStatus,
+    AppointmentType,
     Escalation,
     Message,
     MessageDirection,
@@ -140,6 +143,86 @@ RELAY_TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "agendar_consulta",
+        "description": (
+            "Cria uma CONSULTA na agenda médica da Dra. Leiza para uma paciente. "
+            "Diferente de `agendar_lembrete` (mensagem automática à paciente). Consulta = compromisso "
+            "presencial/teleconsulta da Dra., entra na agenda médica e pode gerar lembrete automático no futuro. "
+            "Use quando a doutora pedir 'agende a Maria pra terça às 14h consulta de retorno', "
+            "'marca a Patricia pra sexta 10h', etc. "
+            "NÃO confunda com 'lembre a Maria amanhã às 9h' (= lembrete = agendar_lembrete)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "telefone": {
+                    "type": "string",
+                    "description": "Telefone E.164 sem +, ex: 5528988030050. Tem que bater com paciente cadastrada.",
+                },
+                "momento_iso": {
+                    "type": "string",
+                    "description": (
+                        "Início da consulta em ISO 8601 com timezone, ex: '2026-04-30T14:00:00-03:00' "
+                        "(Brasília UTC-3). Use a hora atual no contexto pra calcular 'amanhã', 'sexta', etc."
+                    ),
+                },
+                "duracao_min": {
+                    "type": "integer",
+                    "description": "Duração em minutos (default 30 se não especificado).",
+                },
+                "tipo": {
+                    "type": "string",
+                    "enum": ["consulta", "retorno", "exame", "outro"],
+                    "description": "Tipo de consulta. Default 'consulta' se não especificado.",
+                },
+                "obs": {
+                    "type": "string",
+                    "description": "Observação curta (ex: 'trazer USG', 'jejum 8h'). Opcional.",
+                },
+            },
+            "required": ["telefone", "momento_iso"],
+        },
+    },
+    {
+        "name": "cancelar_consulta",
+        "description": (
+            "Cancela uma consulta agendada. Use quando a doutora pedir 'cancela a consulta da Maria de quinta', "
+            "'desmarca aquela das 14h da Patricia', etc. Pegue o id na lista <consultas_proximas> do contexto. "
+            "Múltiplos cancelamentos = múltiplas chamadas."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "ID da consulta a cancelar (vem da lista <consultas_proximas>).",
+                },
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "remarcar_consulta",
+        "description": (
+            "Move uma consulta pra outra data/hora. Use quando a doutora pedir 'remarca a consulta da Patricia "
+            "de sexta pra segunda às 10h', 'passa pra próxima semana', etc."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "ID da consulta a remarcar (vem de <consultas_proximas>).",
+                },
+                "novo_momento_iso": {
+                    "type": "string",
+                    "description": "Novo início em ISO 8601 com timezone, ex: '2026-05-05T10:00:00-03:00'.",
+                },
+            },
+            "required": ["id", "novo_momento_iso"],
+        },
+    },
+    {
         "name": "feedback_interno",
         "description": (
             "Gera uma análise clínica interna pra Dra. Leiza sobre uma paciente específica e ENVIA "
@@ -168,7 +251,7 @@ RELAY_TOOLS: list[dict[str, Any]] = [
 _DEFAULT_RELAY_PROMPT = """\
 Você é assistente da {doctor_name}. Neste contexto, você está recebendo mensagens DA PRÓPRIA {doctor_name}, não de pacientes.
 
-A {doctor_name} costuma usar este canal para 7 coisas:
+A {doctor_name} costuma usar este canal para 10 coisas:
 
 1. **Encaminhar uma resposta dela à paciente** que você escalou recentemente. Ex:
    - "Responda à Patricia que entrarei em contato segunda."
@@ -200,24 +283,56 @@ A {doctor_name} costuma usar este canal para 7 coisas:
    - "O último que agendei" = id mais alto. "Aquele das 12h55" = match pelo horário. "Todos da Maria" = todos cujo paciente seja Maria.
    - Em seguida, use `responder_doutora` confirmando o cancelamento.
 
-4. **Consultar agenda / lembretes pendentes.** Ex:
-   - "Qual minha agenda hoje?"
-   - "O que tenho marcado pra amanhã?"
-   - "Lembretes da Patricia pra essa semana"
+4. **Consultar agenda (CONSULTAS + lembretes).** Ex:
+   - "Qual minha agenda hoje?" / "O que tenho marcado pra amanhã?"
+   - "Consultas da Patricia pra essa semana"
    - "Tem alguma coisa pra hoje à tarde?"
    Quando isso acontecer:
-   - Olhe a lista `<lembretes_pendentes>` no contexto
-   - Filtre mentalmente pelo critério da pergunta (data, paciente, período)
-   - Use `responder_doutora` com a resposta formatada, tipo:
+   - Olhe `<consultas_proximas>` E `<lembretes_pendentes>` no contexto.
+   - Filtre mentalmente (data, paciente, período).
+   - Use `responder_doutora` com formato tipo:
      ```
      Sua agenda de hoje (28/04):
-     • 10h00 — Maria Almeida: confirmar consulta de amanhã
-     • 12h55 — Patricia: lembrete reforço (cães ao banho)
-     ```
-   - Se o filtro retornar vazio, fale isso ("Nada agendado pra amanhã, doutora.")
-   - Se a doutora citar nome ambíguo ou data inválida, peça clarificação.
 
-5. **Feedback interno (apoio à decisão clínica).** Ex:
+     **Consultas:**
+     • 10h00 (30min) — Maria Almeida: consulta de retorno
+     • 14h30 (45min) — Patricia: exame USG
+
+     **Lembretes:**
+     • 12h55 — Patricia: lembrete cães ao banho
+     ```
+   - Se vazio, fale ("Nada agendado pra amanhã, doutora.")
+   - Diferencie claramente CONSULTAS de LEMBRETES — são coisas diferentes.
+
+5. **Agendar uma CONSULTA** na agenda médica. Ex:
+   - "Agende a Patricia pra terça às 14h, retorno"
+   - "Marca a Maria pra sexta 10h consulta de pré-natal"
+   - "Coloca a Aurora amanhã 9h, exame USG, ela trazer jejum 8h"
+   Quando isso acontecer:
+   - Identifique a paciente, calcule `momento_iso` no fuso BRT (UTC-3) usando hora atual do contexto.
+   - Default `duracao_min`=30 se não especificado. Default `tipo`="consulta" (a menos que cite "retorno", "exame").
+   - Use `agendar_consulta(telefone, momento_iso, duracao_min, tipo, obs)`.
+   - Confirme com `responder_doutora` tipo "Consulta da Patricia agendada — terça 06/05 às 14h (retorno)."
+   - **NÃO confunda com "agendar_lembrete"** — lembrete é mensagem automática enviada à paciente; consulta é compromisso médico na agenda da Dra.
+
+6. **Cancelar uma CONSULTA.** Ex:
+   - "Cancela a consulta da Patricia de sexta"
+   - "Desmarca aquela das 14h da Maria"
+   Quando isso acontecer:
+   - Pegue o `id` na lista `<consultas_proximas>` no contexto.
+   - Use `cancelar_consulta(id)`. Múltiplos = chamadas múltiplas.
+   - Confirme com `responder_doutora`.
+
+7. **Remarcar uma CONSULTA.** Ex:
+   - "Remarca a consulta da Maria de sexta pra segunda às 10h"
+   - "Passa a consulta da Aurora pra próxima semana mesmo horário"
+   Quando isso acontecer:
+   - Pegue o `id` na lista `<consultas_proximas>`.
+   - Calcule o novo `momento_iso` em BRT.
+   - Use `remarcar_consulta(id, novo_momento_iso)`.
+   - Confirme com `responder_doutora`.
+
+8. **Feedback interno (apoio à decisão clínica).** Ex:
    - "feedback interno" (logo após uma escalada — assume a paciente da escalada)
    - "fb interno Maria" / "feedback clínico da Patricia" (paciente nomeada)
    - "me dá um feedback sobre a Joana"
@@ -227,9 +342,9 @@ A {doctor_name} costuma usar este canal para 7 coisas:
    - Use `feedback_interno(telefone)` — a tool monta o histórico, roda o raciocínio clínico em modelo separado e ENVIA direto pra doutora.
    - **REGRA RÍGIDA — após `feedback_interno` retornar com sucesso:** PARE. Não chame mais nenhuma ferramenta. Não chame `responder_doutora`. Não envie eco/confirmação. Encerre o turno em silêncio. A doutora já recebeu o feedback completo — uma confirmação adicional só polui o WhatsApp dela.
 
-6. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
+9. **Pergunta ou comando ambíguo** (qual paciente? hora não especificada? mensagem confusa?) — `responder_doutora` pra pedir clarificação curta.
 
-7. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
+10. **Mensagem operacional** (ack, pergunta sobre o sistema, "ok obrigado") — `responder_doutora` curto. Se for só "ok" sem exigir ação, pode chamar com "Combinado, doutora." ou nada.
 
 **Princípios:**
 - A {doctor_name} é superior. Tom cordial-profissional, conciso. Pode chamar "doutora".
@@ -300,6 +415,39 @@ def _now_brt_block() -> str:
         f"  legivel: {weekday_pt}, {now_brt.strftime('%d/%m/%Y às %H:%M')} (Brasília)\n"
         f"</hora_atual_brasil>"
     )
+
+
+def _consultas_proximas_block(db: Session) -> str:
+    """Lista consultas agendadas/confirmadas nos proximos 30 dias — pra agente referenciar."""
+    now_utc = utcnow()
+    cutoff_utc = now_utc + timedelta(days=30)
+    rows = db.exec(
+        select(Appointment, Patient)
+        .join(Patient, Appointment.patient_id == Patient.id)
+        .where(Appointment.scheduled_at >= now_utc)
+        .where(Appointment.scheduled_at <= cutoff_utc)
+        .where(Appointment.status.in_([AppointmentStatus.AGENDADA, AppointmentStatus.CONFIRMADA]))
+        .order_by(Appointment.scheduled_at)
+        .limit(30)
+    ).all()
+
+    if not rows:
+        return "<consultas_proximas>nenhuma consulta agendada nos proximos 30 dias</consultas_proximas>"
+
+    lines = ["<consultas_proximas>"]
+    for ap, pat in rows:
+        when_brt = ap.scheduled_at.replace(tzinfo=timezone.utc).astimezone(_BRT)
+        when_str = when_brt.strftime("%d/%m %H:%M")
+        nome = pat.name or pat.phone
+        tipo = ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo)
+        status = ap.status.value if hasattr(ap.status, "value") else str(ap.status)
+        obs_part = f' | obs: "{ap.obs}"' if ap.obs else ""
+        lines.append(
+            f"  - id={ap.id} | paciente: {nome} ({pat.phone}) | quando: {when_str} BRT "
+            f"| duracao: {ap.duracao_min}min | tipo: {tipo} | status: {status}{obs_part}"
+        )
+    lines.append("</consultas_proximas>")
+    return "\n".join(lines)
 
 
 def _pending_scheduled_block(db: Session) -> str:
@@ -542,6 +690,7 @@ class RelayAgent:
             _now_brt_block(),
             _recent_escalations_block(db),
             _active_patients_block(db),
+            _consultas_proximas_block(db),
             _pending_scheduled_block(db),
         ]
         user_content = (
@@ -584,7 +733,11 @@ class RelayAgent:
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
             if not tool_uses:
-                # Fallback: agent gerou texto sem tool — manda pra doutora
+                # Fallback: agent gerou texto sem tool. SÓ envia se ainda não houve
+                # responder_doutora neste turno (evita eco depois de ação concluída).
+                if responder_doutora_count >= 1:
+                    log.info("relay encerrou — texto trailing ignorado (ja respondeu)")
+                    break
                 text_blocks = [
                     b.text for b in response.content
                     if getattr(b, "type", None) == "text" and getattr(b, "text", "").strip()
@@ -751,6 +904,121 @@ class RelayAgent:
             db.commit()
             log.info("cancelado lembrete id=%d via relay agent", sched_id)
             return f"Lembrete id={sched_id} cancelado com sucesso."
+
+        if name == "agendar_consulta":
+            telefone = str(arguments.get("telefone", "")).strip()
+            momento_iso = str(arguments.get("momento_iso", "")).strip()
+            if not (telefone and momento_iso):
+                return "Erro: telefone e momento_iso são obrigatórios."
+
+            try:
+                momento = datetime.fromisoformat(momento_iso)
+            except ValueError:
+                return f"Erro: momento_iso inválido ('{momento_iso}'). Use ISO 8601 com timezone, ex: 2026-04-30T14:00:00-03:00"
+            if momento.tzinfo is None:
+                momento = momento.replace(tzinfo=_BRT)
+            momento_utc = momento.astimezone(timezone.utc).replace(tzinfo=None)
+
+            now_utc = utcnow()
+            if momento_utc <= now_utc:
+                return f"Erro: momento {momento.isoformat()} já passou. Confirme com a doutora."
+
+            patient = db.exec(select(Patient).where(Patient.phone == telefone)).first()
+            if not patient:
+                return f"Erro: paciente com telefone {telefone} não cadastrada."
+
+            duracao = arguments.get("duracao_min") or 30
+            try:
+                duracao = max(5, int(duracao))
+            except (ValueError, TypeError):
+                duracao = 30
+
+            tipo_raw = str(arguments.get("tipo") or "consulta").strip().lower()
+            try:
+                tipo_enum = AppointmentType(tipo_raw)
+            except ValueError:
+                tipo_enum = AppointmentType.CONSULTA
+
+            obs = str(arguments.get("obs") or "").strip() or None
+
+            ap = Appointment(
+                patient_id=patient.id or 0,
+                scheduled_at=momento_utc,
+                duracao_min=duracao,
+                tipo=tipo_enum,
+                obs=obs,
+                created_by="doctor_relay",
+            )
+            db.add(ap)
+            db.commit()
+            db.refresh(ap)
+
+            human_when = momento.astimezone(_BRT).strftime("%d/%m/%Y às %H:%M")
+            log.info("agendada consulta id=%d para %s em %s", ap.id, telefone, human_when)
+            return f"Consulta id={ap.id} agendada pra {patient.name or telefone} em {human_when} ({tipo_enum.value}, {duracao}min)."
+
+        if name == "cancelar_consulta":
+            ap_id = arguments.get("id")
+            if ap_id is None:
+                return "Erro: id é obrigatório."
+            try:
+                ap_id = int(ap_id)
+            except (ValueError, TypeError):
+                return f"Erro: id inválido ({ap_id})."
+
+            ap = db.exec(select(Appointment).where(Appointment.id == ap_id)).first()
+            if not ap:
+                return f"Erro: consulta id={ap_id} não existe."
+            if ap.status == AppointmentStatus.CANCELADA:
+                return f"Consulta id={ap_id} já estava cancelada."
+            if ap.status == AppointmentStatus.REALIZADA:
+                return f"Erro: consulta id={ap_id} já foi realizada — não dá pra cancelar."
+
+            ap.status = AppointmentStatus.CANCELADA
+            ap.cancelled_at = utcnow()
+            ap.updated_at = utcnow()
+            db.add(ap)
+            db.commit()
+            log.info("cancelada consulta id=%d via relay", ap_id)
+            return f"Consulta id={ap_id} cancelada."
+
+        if name == "remarcar_consulta":
+            ap_id = arguments.get("id")
+            novo_iso = str(arguments.get("novo_momento_iso", "")).strip()
+            if ap_id is None or not novo_iso:
+                return "Erro: id e novo_momento_iso são obrigatórios."
+            try:
+                ap_id = int(ap_id)
+            except (ValueError, TypeError):
+                return f"Erro: id inválido ({ap_id})."
+
+            try:
+                novo_momento = datetime.fromisoformat(novo_iso)
+            except ValueError:
+                return f"Erro: novo_momento_iso inválido ('{novo_iso}')."
+            if novo_momento.tzinfo is None:
+                novo_momento = novo_momento.replace(tzinfo=_BRT)
+            novo_utc = novo_momento.astimezone(timezone.utc).replace(tzinfo=None)
+
+            now_utc = utcnow()
+            if novo_utc <= now_utc:
+                return f"Erro: novo momento {novo_momento.isoformat()} já passou."
+
+            ap = db.exec(select(Appointment).where(Appointment.id == ap_id)).first()
+            if not ap:
+                return f"Erro: consulta id={ap_id} não existe."
+            if ap.status in (AppointmentStatus.CANCELADA, AppointmentStatus.REALIZADA):
+                return f"Erro: consulta id={ap_id} já está {ap.status.value} — não dá pra remarcar."
+
+            ap.scheduled_at = novo_utc
+            ap.status = AppointmentStatus.AGENDADA
+            ap.updated_at = utcnow()
+            db.add(ap)
+            db.commit()
+
+            human_when = novo_momento.astimezone(_BRT).strftime("%d/%m/%Y às %H:%M")
+            log.info("remarcada consulta id=%d pra %s", ap_id, human_when)
+            return f"Consulta id={ap_id} remarcada pra {human_when}."
 
         if name == "feedback_interno":
             telefone = str(arguments.get("telefone", "")).strip()
