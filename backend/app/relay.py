@@ -233,6 +233,7 @@ A {doctor_name} costuma usar este canal para 7 coisas:
 
 **Princípios:**
 - A {doctor_name} é superior. Tom cordial-profissional, conciso. Pode chamar "doutora".
+- **REGRA DE OURO — UMA mensagem por turno:** chame `responder_doutora` NO MÁXIMO 1 vez por turno. Se já chamou alguma tool de ação (`encaminhar_para_paciente`, `agendar_lembrete`, `cancelar_lembrete`, `feedback_interno`), a confirmação à doutora deve ser FEITA NA MESMA chamada de `responder_doutora`, não em uma adicional. Não duplique. Após a confirmação, ENCERRE o turno.
 - Lista de escaladas recentes + outras pacientes ativas + hora atual — tudo no contexto. Use como verdade.
 - Se SOMENTE UMA escalada recente e doutora não especifica paciente, assuma essa.
 - Se ambíguo entre várias, pergunte.
@@ -550,6 +551,10 @@ class RelayAgent:
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
 
+        # Dedup: garante NO MÁXIMO 1 chamada de responder_doutora por turno do relay
+        # (Sonnet às vezes ignora a regra de ouro do prompt e duplica confirmações).
+        responder_doutora_count = 0
+
         for iteration in range(MAX_RELAY_ITERATIONS):
             response = await self._client.messages.create(
                 model=self._model,
@@ -599,6 +604,19 @@ class RelayAgent:
 
             tool_results: list[dict[str, Any]] = []
             for tool_use in tool_uses:
+                # Dedup: bloqueia chamada repetida de responder_doutora no mesmo turno
+                if tool_use.name == "responder_doutora":
+                    if responder_doutora_count >= 1:
+                        log.info("relay dedup: responder_doutora ja chamada neste turno — bloqueada")
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_use.id,
+                            "content": "Confirmação à doutora já foi enviada neste turno. Encerre o turno.",
+                            "is_error": True,
+                        })
+                        continue
+                    responder_doutora_count += 1
+
                 try:
                     result = await self._execute_tool(
                         tool_use.name,
