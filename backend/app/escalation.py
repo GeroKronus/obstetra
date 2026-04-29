@@ -35,3 +35,22 @@ async def notify_doctor(
     except Exception:
         log.exception("failed to notify doctor for motivo=%s", motivo)
         return False
+
+
+async def notify_secretary(
+    provider: WhatsAppProvider,
+    *,
+    text: str,
+) -> bool:
+    """Envia notificacao pra secretaria (telefone separado).
+    Fallback pra doutora se SECRETARY_PHONE_NUMBER nao configurado."""
+    target = settings.secretary_phone_number or settings.doctor_phone_number
+    if not target:
+        log.warning("notify_secretary sem destino — nem SECRETARY_PHONE_NUMBER nem DOCTOR_PHONE_NUMBER")
+        return False
+    try:
+        await provider.send_text(target, text)
+        return True
+    except Exception:
+        log.exception("failed to notify secretary")
+        return False

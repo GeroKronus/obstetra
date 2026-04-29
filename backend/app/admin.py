@@ -500,7 +500,11 @@ async def admin_agenda_nova_submit(
         )
         db.add(ap)
         db.commit()
+        db.refresh(ap)
         log.info("agenda nova consulta paciente=%s em %s", cleaned_phone, when_brt.isoformat(timespec="minutes"))
+
+        from .reminders import sync_appointment_reminder
+        sync_appointment_reminder(db, ap)
 
     return RedirectResponse(url=f"/admin/agenda?data={d.isoformat()}", status_code=303)
 
@@ -594,6 +598,10 @@ async def admin_agenda_editar_submit(
             ap.cancelled_at = utcnow()
         db.add(ap)
         db.commit()
+        db.refresh(ap)
+
+        from .reminders import sync_appointment_reminder
+        sync_appointment_reminder(db, ap)
 
     return RedirectResponse(url=f"/admin/agenda?data={d.isoformat()}", status_code=303)
 
@@ -616,7 +624,11 @@ async def admin_agenda_cancelar(
         ap.updated_at = utcnow()
         db.add(ap)
         db.commit()
+        db.refresh(ap)
         d_iso = ap.scheduled_at.date().isoformat()
+
+        from .reminders import sync_appointment_reminder
+        sync_appointment_reminder(db, ap)
 
     return RedirectResponse(url=f"/admin/agenda?data={d_iso}", status_code=303)
 

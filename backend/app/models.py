@@ -26,6 +26,7 @@ class Tenant(SQLModel, table=True):
     name: str  # nome amigavel da clinica/medico (ex: "Dra. Leiza Moulin")
     doctor_name: str  # como chamar nos prompts (ex: "Dra. Leiza")
     doctor_phone: str  # E.164 sem +, ex: 5528981110534
+    secretary_phone: Optional[str] = None  # E.164 sem +; recebe avisos de desistencia
     evolution_instance_name: str  # qual instancia Evolution recebe webhooks desse tenant
     admin_user: str  # username do painel web
     admin_password_hash: str  # bcrypt hash da senha
@@ -145,11 +146,13 @@ class Escalation(SQLModel, table=True):
 
 class ScheduledMessage(SQLModel, table=True):
     """Mensagem agendada pra enviar a uma paciente em momento futuro.
-    Tipicamente criada pelo relay agent quando a Dra. pede um lembrete.
+    Tipicamente criada pelo relay agent quando a Dra. pede um lembrete,
+    ou automaticamente 24h antes de uma consulta.
     """
     id: Optional[int] = Field(default=None, primary_key=True)
     tenant_id: int = Field(default=1, foreign_key="tenant.id", index=True)
     patient_id: int = Field(foreign_key="patient.id", index=True)
+    appointment_id: Optional[int] = Field(default=None, foreign_key="appointment.id", index=True)
     text: str
     scheduled_at: datetime = Field(index=True)  # armazenado em UTC
     sent_at: Optional[datetime] = Field(default=None, index=True)

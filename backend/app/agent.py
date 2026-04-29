@@ -5,10 +5,15 @@ from typing import Any
 import anthropic
 from sqlmodel import Session, select
 
+from datetime import timedelta, timezone
+from zoneinfo import ZoneInfo
+
 from . import vault
 from .config import settings
-from .escalation import notify_doctor
+from .escalation import notify_doctor, notify_secretary
 from .models import (
+    Appointment,
+    AppointmentStatus,
     Escalation,
     Message,
     MessageDirection,
@@ -71,6 +76,52 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["motivo", "resumo"],
         },
     },
+    {
+        "name": "confirmar_consulta",
+        "description": (
+            "Use APENAS quando a paciente está respondendo afirmativamente a um lembrete "
+            "de consulta (ex: 'sim', 'vou estar lá', 'tô confirmando', 'pode contar comigo'). "
+            "Marca a consulta como confirmada. SEMPRE chame `responder_paciente` ANTES "
+            "(ou na mesma chamada lógica) pra dar feedback positivo. "
+            "O id da consulta vem do contexto `<consulta_proxima>` que aparece quando "
+            "a paciente tem uma consulta nas próximas 48h."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "ID da consulta a confirmar (vem de <consulta_proxima> no contexto).",
+                },
+            },
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "marcar_desistencia_consulta",
+        "description": (
+            "Use APENAS quando a paciente está respondendo NEGATIVAMENTE a um lembrete de "
+            "consulta (ex: 'não vou conseguir', 'preciso desmarcar', 'não vai dar'). "
+            "Marca consulta como cancelada e AVISA A SECRETÁRIA pra ela poder dar o slot "
+            "pra outra paciente que pediu encaixe. SEMPRE chame `responder_paciente` ANTES "
+            "(ou logo após) com algo como 'Sem problema, anotei. Quando puder remarcar, é "
+            "só me chamar.' — A INICIATIVA DE REMARCAR É DA PACIENTE, não nossa."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "ID da consulta a cancelar (vem de <consulta_proxima> no contexto).",
+                },
+                "motivo": {
+                    "type": "string",
+                    "description": "Motivo curto que a paciente deu (ex: 'imprevisto no trabalho', 'não pode mais').",
+                },
+            },
+            "required": ["id"],
+        },
+    },
 ]
 
 
@@ -78,6 +129,43 @@ def _load_system_prompt() -> str:
     template = _PROTOCOL_PATH.read_text(encoding="utf-8")
     red_flags = "\n".join(f"- {flag}" for flag in RED_FLAGS_GESTANTES)
     return template.format(doctor_name=settings.doctor_name, red_flags=red_flags)
+
+
+def _consulta_proxima_block(db: Session, patient_id: int) -> str:
+    """Se a paciente tem consulta nas proximas 48h (agendada/confirmada/remarcada),
+    inclui no contexto. Crucial pra agent saber se mensagem dela e' resposta a um lembrete."""
+    now_utc = utcnow()
+    cutoff = now_utc + timedelta(hours=48)
+    rows = db.exec(
+        select(Appointment)
+        .where(Appointment.patient_id == patient_id)
+        .where(Appointment.scheduled_at >= now_utc)
+        .where(Appointment.scheduled_at <= cutoff)
+        .where(Appointment.status.in_([AppointmentStatus.AGENDADA, AppointmentStatus.CONFIRMADA, AppointmentStatus.REMARCADA]))
+        .order_by(Appointment.scheduled_at)
+        .limit(3)
+    ).all()
+
+    if not rows:
+        return "<consulta_proxima>nenhuma consulta nas proximas 48h</consulta_proxima>"
+
+    brt = ZoneInfo("America/Sao_Paulo")
+    lines = ["<consulta_proxima>"]
+    for ap in rows:
+        when_brt = ap.scheduled_at.replace(tzinfo=timezone.utc).astimezone(brt)
+        when_str = when_brt.strftime("%d/%m %H:%M")
+        tipo = ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo)
+        status = ap.status.value if hasattr(ap.status, "value") else str(ap.status)
+        lines.append(
+            f"  - id={ap.id} | quando: {when_str} BRT | tipo: {tipo} | status: {status}"
+        )
+    lines.append("</consulta_proxima>")
+    lines.append(
+        "<!-- Se a mensagem da paciente parecer resposta a um lembrete dessa consulta "
+        "(confirmando/desistindo), use as tools confirmar_consulta(id) ou "
+        "marcar_desistencia_consulta(id). -->"
+    )
+    return "\n".join(lines)
 
 
 def _patient_context_block(patient: Patient) -> str:
@@ -98,6 +186,7 @@ def _build_messages(
     history: list[Message],
     inbound_text: str,
     vault_ctx: vault.PatientContext,
+    consulta_proxima_block: str,
 ) -> list[dict[str, Any]]:
     msgs: list[dict[str, Any]] = []
     for m in history:
@@ -107,6 +196,7 @@ def _build_messages(
     last_user_content = (
         f"{vault_ctx.to_prompt_block()}\n\n"
         f"{_patient_context_block(patient)}\n\n"
+        f"{consulta_proxima_block}\n\n"
         f"{inbound_text}"
     )
     msgs.append({"role": "user", "content": last_user_content})
@@ -141,7 +231,8 @@ class ClinicalAgent:
             log.exception("vault.read_patient falhou — seguindo sem contexto")
             vault_ctx = vault.PatientContext(found=False)
 
-        messages = _build_messages(patient, history, inbound_text, vault_ctx)
+        consulta_proxima_block = _consulta_proxima_block(db, patient.id or 0)
+        messages = _build_messages(patient, history, inbound_text, vault_ctx, consulta_proxima_block)
 
         # Track o que aconteceu neste turno pra logar no vault depois
         outbound_msgs_this_turn: list[str] = []
@@ -350,6 +441,80 @@ class ClinicalAgent:
             if sent:
                 return "Doutora notificada com sucesso."
             return "Doutora NÃO foi notificada (DOCTOR_PHONE_NUMBER não configurado ou falha no envio). Continue a atender a paciente normalmente e informe que a doutora será avisada assim que possível."
+
+        if name == "confirmar_consulta":
+            ap_id = arguments.get("id")
+            if ap_id is None:
+                return "Erro: id é obrigatório."
+            try:
+                ap_id = int(ap_id)
+            except (ValueError, TypeError):
+                return f"Erro: id inválido ({ap_id})."
+
+            ap = db.exec(
+                select(Appointment)
+                .where(Appointment.id == ap_id)
+                .where(Appointment.patient_id == patient.id)
+            ).first()
+            if not ap:
+                return f"Erro: consulta id={ap_id} não pertence a essa paciente."
+            if ap.status == AppointmentStatus.CANCELADA:
+                return f"Consulta id={ap_id} já estava cancelada — não dá pra confirmar."
+
+            ap.status = AppointmentStatus.CONFIRMADA
+            ap.updated_at = utcnow()
+            db.add(ap)
+            db.commit()
+            log.info("paciente confirmou consulta id=%d (patient=%s)", ap_id, patient.phone)
+            return f"Consulta id={ap_id} marcada como CONFIRMADA."
+
+        if name == "marcar_desistencia_consulta":
+            ap_id = arguments.get("id")
+            motivo = str(arguments.get("motivo", "")).strip()
+            if ap_id is None:
+                return "Erro: id é obrigatório."
+            try:
+                ap_id = int(ap_id)
+            except (ValueError, TypeError):
+                return f"Erro: id inválido ({ap_id})."
+
+            ap = db.exec(
+                select(Appointment)
+                .where(Appointment.id == ap_id)
+                .where(Appointment.patient_id == patient.id)
+            ).first()
+            if not ap:
+                return f"Erro: consulta id={ap_id} não pertence a essa paciente."
+
+            ap.status = AppointmentStatus.CANCELADA
+            ap.cancelled_at = utcnow()
+            ap.updated_at = utcnow()
+            db.add(ap)
+            db.commit()
+            db.refresh(ap)
+
+            # Cancela o lembrete linkado tambem (se houver)
+            from .reminders import sync_appointment_reminder
+            sync_appointment_reminder(db, ap)
+
+            # Notifica SECRETARIA (com fallback pra doutora se nao houver SECRETARY_PHONE)
+            from datetime import timezone as _tz
+            from zoneinfo import ZoneInfo as _ZI
+            when_brt = ap.scheduled_at.replace(tzinfo=_tz.utc).astimezone(_ZI("America/Sao_Paulo"))
+            when_str = when_brt.strftime("%d/%m/%Y às %H:%M")
+            tipo = ap.tipo.value if hasattr(ap.tipo, "value") else str(ap.tipo)
+            display_name = patient.name or patient.phone
+            motivo_part = f"\nMotivo informado: \"{motivo}\"" if motivo else ""
+            text = (
+                f"*[Obstetra — desistência]*\n"
+                f"A paciente *{display_name}* (+{patient.phone}) avisou que NÃO vai conseguir vir "
+                f"na consulta marcada pra *{when_str}* ({tipo}).{motivo_part}\n\n"
+                f"O slot está liberado pra encaixe. A iniciativa de remarcar é da paciente — ela "
+                f"voltará a falar quando puder. Se quiser, entre em contato com ela."
+            )
+            await notify_secretary(provider, text=text)
+            log.info("paciente desistiu consulta id=%d (patient=%s) — secretaria notificada", ap_id, patient.phone)
+            return f"Consulta id={ap_id} cancelada por desistência da paciente. Secretária notificada."
 
         return f"Ferramenta desconhecida: {name}"
 

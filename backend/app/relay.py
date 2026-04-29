@@ -953,6 +953,9 @@ class RelayAgent:
             db.commit()
             db.refresh(ap)
 
+            from .reminders import sync_appointment_reminder
+            sync_appointment_reminder(db, ap)
+
             human_when = momento.astimezone(_BRT).strftime("%d/%m/%Y às %H:%M")
             log.info("agendada consulta id=%d para %s em %s", ap.id, telefone, human_when)
             return f"Consulta id={ap.id} agendada pra {patient.name or telefone} em {human_when} ({tipo_enum.value}, {duracao}min)."
@@ -979,6 +982,11 @@ class RelayAgent:
             ap.updated_at = utcnow()
             db.add(ap)
             db.commit()
+            db.refresh(ap)
+
+            from .reminders import sync_appointment_reminder
+            sync_appointment_reminder(db, ap)
+
             log.info("cancelada consulta id=%d via relay", ap_id)
             return f"Consulta id={ap_id} cancelada."
 
@@ -1015,6 +1023,10 @@ class RelayAgent:
             ap.updated_at = utcnow()
             db.add(ap)
             db.commit()
+            db.refresh(ap)
+
+            from .reminders import sync_appointment_reminder
+            sync_appointment_reminder(db, ap)
 
             human_when = novo_momento.astimezone(_BRT).strftime("%d/%m/%Y às %H:%M")
             log.info("remarcada consulta id=%d pra %s", ap_id, human_when)

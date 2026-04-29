@@ -18,10 +18,17 @@ if _db_url.startswith("sqlite:///"):
         db_path = Path(path_part).resolve()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+if _db_url.startswith("sqlite"):
+    _connect_args = {"check_same_thread": False}
+else:
+    # Forca UTF-8 na conexao Postgres pra evitar double-encoding em strings
+    # com acentos ("ã" → "Ã£") quando o servidor tem client_encoding != utf8
+    _connect_args = {"client_encoding": "utf8"}
+
 engine = create_engine(
     _db_url,
     echo=False,
-    connect_args={"check_same_thread": False} if _db_url.startswith("sqlite") else {},
+    connect_args=_connect_args,
 )
 
 
@@ -51,6 +58,8 @@ def _run_lightweight_migrations() -> None:
         ("escalation",       "tenant_id",        "INTEGER NOT NULL DEFAULT 1"),
         ("scheduledmessage", "tenant_id",        "INTEGER NOT NULL DEFAULT 1"),
         ("appointment",      "tenant_id",        "INTEGER NOT NULL DEFAULT 1"),
+        ("tenant",           "secretary_phone",  "TEXT NULL"),
+        ("scheduledmessage", "appointment_id",   "INTEGER NULL"),
 
         # Patient: campos de anamnese
         ("patient", "data_nascimento",            "DATE NULL"),
@@ -143,6 +152,9 @@ def _bootstrap_default_tenant() -> None:
             if existing.evolution_instance_name != settings.evolution_instance_name:
                 existing.evolution_instance_name = settings.evolution_instance_name
                 changed = True
+            if (existing.secretary_phone or "") != (settings.secretary_phone_number or ""):
+                existing.secretary_phone = settings.secretary_phone_number or None
+                changed = True
             if changed:
                 from .models import utcnow
                 existing.updated_at = utcnow()
@@ -158,6 +170,7 @@ def _bootstrap_default_tenant() -> None:
             name=settings.doctor_name,
             doctor_name=settings.doctor_name,
             doctor_phone=settings.doctor_phone_number or "",
+            secretary_phone=settings.secretary_phone_number or None,
             evolution_instance_name=settings.evolution_instance_name,
             admin_user=settings.admin_user,
             admin_password_hash=_hash_password(settings.admin_password),

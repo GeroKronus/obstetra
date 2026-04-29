@@ -16,6 +16,9 @@ class Settings(BaseSettings):
 
     doctor_phone_number: str = ""
     doctor_name: str = "Dra. Leiza"
+    # Telefone da secretaria — recebe notificacoes de desistencia de paciente
+    # (oportunidade de encaixe). Pode ficar vazio; nesse caso vai pra doutora.
+    secretary_phone_number: str = ""
 
     database_url: str = "sqlite:///./data/obstetra.db"
 
