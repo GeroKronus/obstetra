@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # (oportunidade de encaixe). Pode ficar vazio; nesse caso vai pra doutora.
     secretary_phone_number: str = ""
 
+    # Suspende o bot temporariamente. Quando true, webhook ignora mensagens
+    # inbound e scheduler nao dispara lembretes/consultas agendadas. Util
+    # quando o numero WhatsApp e' pareado em outro projeto temporariamente.
+    bot_paused: bool = False
+
     database_url: str = "sqlite:///./data/obstetra.db"
 
     log_level: str = "INFO"

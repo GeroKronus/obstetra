@@ -108,7 +108,10 @@ async def scheduler_loop() -> None:
     log.info("scheduler iniciado (poll a cada %ds)", POLL_INTERVAL_SECONDS)
     while True:
         try:
-            await _run_due_now()
+            if settings.bot_paused:
+                log.info("scheduler: bot_paused=true — pulando ciclo")
+            else:
+                await _run_due_now()
         except asyncio.CancelledError:
             log.info("scheduler cancelado — saindo")
             raise

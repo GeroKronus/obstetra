@@ -354,6 +354,11 @@ async def receive_webhook(request: Request, background: BackgroundTasks) -> dict
     event = payload.get("event")
     log.info("webhook event=%s instance=%s", event, payload.get("instance"))
 
+    if settings.bot_paused:
+        # Bot suspenso temporariamente — descarta tudo sem processar nem responder
+        log.info("bot_paused=true — descartando webhook event=%s", event)
+        return {"ignored": "bot_paused"}
+
     if event != "messages.upsert":
         return {"ignored": True}
 
