@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     # quando o numero WhatsApp e' pareado em outro projeto temporariamente.
     bot_paused: bool = False
 
+    # Janela (minutos) em que uma nova escalada da MESMA paciente nao re-notifica
+    # a doutora — evita 3 alertas quase identicos no mesmo caso. Upgrade de
+    # severidade (novo motivo red_flag quando o anterior nao era) fura a trava.
+    escalation_cooldown_minutes: int = 30
+
     database_url: str = "sqlite:///./data/obstetra.db"
 
     log_level: str = "INFO"

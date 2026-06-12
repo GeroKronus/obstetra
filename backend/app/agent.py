@@ -422,6 +422,43 @@ class ClinicalAgent:
         if name == "escalar_para_doutora":
             motivo = str(arguments.get("motivo", "incerteza"))
             resumo = str(arguments.get("resumo", "")).strip()
+
+            # Trava anti-spam: se a doutora ja foi notificada sobre essa paciente
+            # dentro da janela de cooldown, registra a escalada mas NAO re-notifica.
+            # Excecao: upgrade de severidade (novo red_flag quando o anterior nao era).
+            last_esc = db.exec(
+                select(Escalation)
+                .where(Escalation.patient_id == patient.id)
+                .where(Escalation.notified_doctor == True)  # noqa: E712
+                .order_by(Escalation.created_at.desc())
+                .limit(1)
+            ).first()
+            if last_esc is not None:
+                elapsed = utcnow() - last_esc.created_at
+                cooldown = timedelta(minutes=settings.escalation_cooldown_minutes)
+                severity_upgrade = motivo == "red_flag" and last_esc.reason != "red_flag"
+                if elapsed < cooldown and not severity_upgrade:
+                    db.add(
+                        Escalation(
+                            patient_id=patient.id,
+                            reason=motivo,
+                            summary=resumo,
+                            notified_doctor=False,
+                        )
+                    )
+                    db.commit()
+                    mins = max(1, int(elapsed.total_seconds() // 60))
+                    log.info(
+                        "escalada suprimida (cooldown): patient=%s motivo=%s ultima ha %dmin",
+                        patient.phone, motivo, mins,
+                    )
+                    return (
+                        f"A doutora JÁ foi notificada sobre essa paciente há {mins} minuto(s) — "
+                        f"re-notificação suprimida pra evitar alertas duplicados. A atualização foi "
+                        f"registrada internamente. Continue atendendo normalmente e NÃO prometa um "
+                        f"novo aviso à doutora (ela já está ciente do caso)."
+                    )
+
             sent = await notify_doctor(
                 provider,
                 patient_name=patient.name,
