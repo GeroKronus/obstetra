@@ -1,6 +1,9 @@
 import logging
 
+from sqlmodel import Session, select
+
 from .config import settings
+from .models import Escalation, EscalationStatus, Patient, utcnow
 from .providers.base import WhatsAppProvider
 
 log = logging.getLogger("obstetra.escalation")
@@ -35,6 +38,49 @@ async def notify_doctor(
     except Exception:
         log.exception("failed to notify doctor for motivo=%s", motivo)
         return False
+
+
+async def flush_pending_escalation(
+    db: Session,
+    provider: WhatsAppProvider,
+    patient: Patient,
+) -> bool:
+    """Envia pra doutora a escalada pendente mais recente da paciente (resumo
+    mais completo) e marca como enviada. Pendentes anteriores viram superseded.
+
+    Retorna True se algo foi enviado."""
+    pendings = db.exec(
+        select(Escalation)
+        .where(Escalation.patient_id == patient.id)
+        .where(Escalation.status == EscalationStatus.PENDING)
+        .order_by(Escalation.created_at.desc())
+    ).all()
+    if not pendings:
+        return False
+
+    latest = pendings[0]
+    sent = await notify_doctor(
+        provider,
+        patient_name=patient.name,
+        patient_phone=patient.phone,
+        motivo=latest.reason,
+        resumo=latest.summary,
+    )
+
+    latest.status = EscalationStatus.SENT
+    latest.notified_doctor = sent
+    latest.sent_at = utcnow()
+    db.add(latest)
+    for older in pendings[1:]:
+        older.status = EscalationStatus.SUPERSEDED
+        db.add(older)
+    db.commit()
+
+    log.info(
+        "escalada pendente enviada (patient=%s, motivo=%s, %d antigas superseded, sent=%s)",
+        patient.phone, latest.reason, len(pendings) - 1, sent,
+    )
+    return sent
 
 
 async def notify_secretary(

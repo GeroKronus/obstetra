@@ -10,11 +10,12 @@ from zoneinfo import ZoneInfo
 
 from . import vault
 from .config import settings
-from .escalation import notify_doctor, notify_secretary
+from .escalation import flush_pending_escalation, notify_secretary
 from .models import (
     Appointment,
     AppointmentStatus,
     Escalation,
+    EscalationStatus,
     Message,
     MessageDirection,
     OnboardingState,
@@ -53,9 +54,13 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "escalar_para_doutora",
         "description": (
-            "Notifica a Dra. Leiza no WhatsApp dela. Use com parcimônia, apenas "
-            "quando realmente necessário. Sempre responda a paciente ANTES de "
-            "escalar (com responder_paciente), para que ela saiba o que fazer."
+            "Registra o caso pra Dra. Leiza ser avisada no WhatsApp dela. O aviso é "
+            "enviado AUTOMATICAMENTE quando a conversa com a paciente encerrar (ou após "
+            "alguns minutos de silêncio) — então escale ASSIM QUE identificar o motivo, "
+            "sem medo de interromper a conversa. Se mais informação relevante surgir nos "
+            "turnos seguintes, chame de novo com o resumo ATUALIZADO E COMPLETO — a versão "
+            "mais recente substitui a anterior (a doutora recebe só uma, a mais completa). "
+            "Sempre responda a paciente no mesmo turno (com responder_paciente)."
         ),
         "input_schema": {
             "type": "object",
@@ -380,6 +385,23 @@ class ClinicalAgent:
         db.add(patient)
         db.commit()
 
+        # Escalada diferida: se ha pendente e a paciente sinalizou que terminou
+        # (despedida ou autorizacao "pode passar pra doutora"), envia o resumo
+        # consolidado agora. Caso contrario o scheduler envia apos o timeout.
+        try:
+            has_pending = db.exec(
+                select(Escalation)
+                .where(Escalation.patient_id == patient.id)
+                .where(Escalation.status == EscalationStatus.PENDING)
+                .limit(1)
+            ).first() is not None
+            if has_pending:
+                from .classifier import is_closing_message
+                if await is_closing_message(inbound_text):
+                    await flush_pending_escalation(db, provider, patient)
+        except Exception:
+            log.exception("flush de escalada pendente falhou (patient=%s)", patient.phone)
+
         # Loga o turno no vault (best-effort — não falha o fluxo se quebrar)
         try:
             escalation_summary = None
@@ -423,61 +445,44 @@ class ClinicalAgent:
             motivo = str(arguments.get("motivo", "incerteza"))
             resumo = str(arguments.get("resumo", "")).strip()
 
-            # Trava anti-spam: se a doutora ja foi notificada sobre essa paciente
-            # dentro da janela de cooldown, registra a escalada mas NAO re-notifica.
-            # Excecao: upgrade de severidade (novo red_flag quando o anterior nao era).
-            last_esc = db.exec(
+            # Escalada e' DIFERIDA: registra como pendente; o envio acontece quando
+            # a conversa encerra (despedida da paciente) ou apos timeout de silencio.
+            # Se ja existe pendente, a nova substitui (resumo mais completo vence).
+            existing_pendings = db.exec(
                 select(Escalation)
                 .where(Escalation.patient_id == patient.id)
-                .where(Escalation.notified_doctor == True)  # noqa: E712
-                .order_by(Escalation.created_at.desc())
-                .limit(1)
-            ).first()
-            if last_esc is not None:
-                elapsed = utcnow() - last_esc.created_at
-                cooldown = timedelta(minutes=settings.escalation_cooldown_minutes)
-                severity_upgrade = motivo == "red_flag" and last_esc.reason != "red_flag"
-                if elapsed < cooldown and not severity_upgrade:
-                    db.add(
-                        Escalation(
-                            patient_id=patient.id,
-                            reason=motivo,
-                            summary=resumo,
-                            notified_doctor=False,
-                        )
-                    )
-                    db.commit()
-                    mins = max(1, int(elapsed.total_seconds() // 60))
-                    log.info(
-                        "escalada suprimida (cooldown): patient=%s motivo=%s ultima ha %dmin",
-                        patient.phone, motivo, mins,
-                    )
-                    return (
-                        f"A doutora JÁ foi notificada sobre essa paciente há {mins} minuto(s) — "
-                        f"re-notificação suprimida pra evitar alertas duplicados. A atualização foi "
-                        f"registrada internamente. Continue atendendo normalmente e NÃO prometa um "
-                        f"novo aviso à doutora (ela já está ciente do caso)."
-                    )
+                .where(Escalation.status == EscalationStatus.PENDING)
+            ).all()
+            for old in existing_pendings:
+                old.status = EscalationStatus.SUPERSEDED
+                db.add(old)
 
-            sent = await notify_doctor(
-                provider,
-                patient_name=patient.name,
-                patient_phone=patient.phone,
-                motivo=motivo,
-                resumo=resumo,
-            )
             db.add(
                 Escalation(
                     patient_id=patient.id,
                     reason=motivo,
                     summary=resumo,
-                    notified_doctor=sent,
+                    notified_doctor=False,
+                    status=EscalationStatus.PENDING,
                 )
             )
             db.commit()
-            if sent:
-                return "Doutora notificada com sucesso."
-            return "Doutora NÃO foi notificada (DOCTOR_PHONE_NUMBER não configurado ou falha no envio). Continue a atender a paciente normalmente e informe que a doutora será avisada assim que possível."
+            log.info(
+                "escalada registrada como pendente (patient=%s, motivo=%s, %d antigas superseded)",
+                patient.phone, motivo, len(existing_pendings),
+            )
+            return (
+                "Escalada registrada. A doutora receberá o resumo completo quando a conversa "
+                "com a paciente encerrar (ou em poucos minutos, automaticamente). "
+                "REGRAS PARA O RESTO DA CONVERSA: "
+                "(1) Se a situação NÃO for urgência imediata, pergunte à paciente algo como "
+                "'Quer acrescentar alguma coisa que ache importante, ou já posso passar tudo "
+                "pra Dra. Leiza?' — a resposta dela ('pode passar', 'só isso') dispara o envio. "
+                "(2) Se for urgência (paciente indo ao PS), NÃO faça essa pergunta — finalize a "
+                "orientação normalmente; o aviso sai sozinho em poucos minutos. "
+                "(3) Se surgir informação nova relevante, chame esta ferramenta de novo com o "
+                "resumo ATUALIZADO e COMPLETO — a versão mais recente substitui a anterior."
+            )
 
         if name == "confirmar_consulta":
             ap_id = arguments.get("id")

@@ -134,6 +134,12 @@ class Message(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow, index=True)
 
 
+class EscalationStatus(str, Enum):
+    PENDING = "pending"        # registrada; aguardando fim da conversa pra notificar
+    SENT = "sent"              # notificacao enviada a doutora
+    SUPERSEDED = "superseded"  # substituida por uma versao mais completa na mesma conversa
+
+
 class Escalation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     tenant_id: int = Field(default=1, foreign_key="tenant.id", index=True)
@@ -141,6 +147,8 @@ class Escalation(SQLModel, table=True):
     reason: str
     summary: str
     notified_doctor: bool = False
+    status: EscalationStatus = Field(default=EscalationStatus.SENT, index=True)
+    sent_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 

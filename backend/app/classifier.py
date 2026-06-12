@@ -18,13 +18,15 @@ _HAIKU_MODEL = "claude-haiku-4-5"
 
 _CLOSING_PROMPT = """\
 Sua única tarefa é classificar se uma mensagem trocada entre médica e paciente \
-sinaliza encerramento natural da conversa atual (despedida, agradecimento final, \
-fechamento, "até logo", "tchau", "obrigada", "vou indo", "qualquer coisa eu te chamo", \
-"até segunda", "beijos", etc.).
+sinaliza encerramento natural da conversa atual. Conta como encerramento:
+- despedida ou agradecimento final ("até logo", "tchau", "obrigada", "vou indo", \
+"qualquer coisa eu te chamo", "até segunda", "beijos", etc.)
+- autorização pra comunicar/passar o caso pra doutora ("pode passar", "pode avisar \
+ela", "pode comunicar", "só isso mesmo", "não tenho mais nada a acrescentar", "é isso")
 
 Responda EXATAMENTE com uma das duas palavras, sem mais nada:
-- SIM (se a mensagem é uma despedida ou encerramento claro)
-- NAO (se a mensagem é uma pergunta, pedido de informação, sintoma, ou continuação ativa do diálogo)
+- SIM (despedida, encerramento claro, ou autorização pra comunicar a doutora)
+- NAO (pergunta, pedido de informação, sintoma novo, ou continuação ativa do diálogo)
 
 Mensagem a classificar:
 "{text}"
@@ -53,6 +55,8 @@ async def is_closing_message(text: str) -> bool:
             "tchau", "até logo", "até mais", "obrigada doutora", "obrigado doutora",
             "obrigada", "obrigado", "valeu", "beijos", "abraço", "abraços",
             "até semana", "até segunda", "até amanhã", "boa noite",
+            "pode passar", "pode avisar", "pode comunicar", "pode falar com ela",
+            "só isso", "é só isso", "so isso", "é isso", "nada mais", "mais nada",
         )
         for kw in triviais:
             if kw in lowered:

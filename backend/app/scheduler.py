@@ -103,6 +103,51 @@ async def _run_due_now() -> None:
             await provider.aclose()
 
 
+async def _flush_stale_escalations() -> None:
+    """Escaladas pendentes cuja conversa esfriou: envia pra doutora mesmo sem
+    a paciente ter se despedido. Timeout: 5min pra red_flag, 10min pro resto."""
+    from datetime import timedelta
+
+    from .escalation import flush_pending_escalation
+    from .models import Escalation, EscalationStatus
+
+    with Session(engine) as db:
+        pendings = db.exec(
+            select(Escalation).where(Escalation.status == EscalationStatus.PENDING)
+        ).all()
+        if not pendings:
+            return
+
+        by_patient: dict[int, list] = {}
+        for e in pendings:
+            by_patient.setdefault(e.patient_id, []).append(e)
+
+        now = utcnow()
+        provider = EvolutionProvider()
+        try:
+            for pid, escs in by_patient.items():
+                patient = db.exec(select(Patient).where(Patient.id == pid)).first()
+                if not patient:
+                    continue
+                last_msg = db.exec(
+                    select(Message)
+                    .where(Message.patient_id == pid)
+                    .order_by(Message.created_at.desc())
+                    .limit(1)
+                ).first()
+                last_activity = last_msg.created_at if last_msg else max(e.created_at for e in escs)
+                has_red_flag = any(e.reason == "red_flag" for e in escs)
+                timeout_min = 5 if has_red_flag else 10
+                if (now - last_activity) >= timedelta(minutes=timeout_min):
+                    log.info(
+                        "escalada pendente de %s esfriou (%dmin) — enviando por timeout",
+                        patient.phone, timeout_min,
+                    )
+                    await flush_pending_escalation(db, provider, patient)
+        finally:
+            await provider.aclose()
+
+
 async def scheduler_loop() -> None:
     """Loop infinito do scheduler. Rodado como background task no lifespan."""
     log.info("scheduler iniciado (poll a cada %ds)", POLL_INTERVAL_SECONDS)
@@ -112,6 +157,7 @@ async def scheduler_loop() -> None:
                 log.info("scheduler: bot_paused=true — pulando ciclo")
             else:
                 await _run_due_now()
+                await _flush_stale_escalations()
         except asyncio.CancelledError:
             log.info("scheduler cancelado — saindo")
             raise

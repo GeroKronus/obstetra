@@ -60,6 +60,8 @@ def _run_lightweight_migrations() -> None:
         ("appointment",      "tenant_id",        "INTEGER NOT NULL DEFAULT 1"),
         ("tenant",           "secretary_phone",  "TEXT NULL"),
         ("scheduledmessage", "appointment_id",   "INTEGER NULL"),
+        ("escalation",       "status",           "TEXT NOT NULL DEFAULT 'SENT'"),
+        ("escalation",       "sent_at",          "TIMESTAMP NULL"),
 
         # Patient: campos de anamnese
         ("patient", "data_nascimento",            "DATE NULL"),
